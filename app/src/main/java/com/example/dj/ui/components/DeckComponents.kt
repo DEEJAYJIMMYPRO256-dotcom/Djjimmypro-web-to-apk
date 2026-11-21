@@ -6,6 +6,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
@@ -41,9 +44,14 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,6 +61,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -64,13 +73,18 @@ import com.example.dj.model.EqBand
 import com.example.dj.model.EqPreset
 import com.example.dj.model.MixerTheme
 import com.example.dj.model.StemType
+import com.example.dj.model.WaveformZoomConfig
+import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 fun DeckPanel(
@@ -102,6 +116,11 @@ fun DeckPanel(
   onToggleKeyLock: () -> Unit,
   onToggleLoop: () -> Unit,
   onCycleLoopBeats: () -> Unit,
+  onTriggerAutoLoop: (Float) -> Unit = {},
+  onHalveLoop: () -> Unit = {},
+  onDoubleLoop: () -> Unit = {},
+  onToggleQuickIsolate: () -> Unit = {},
+  onKeySync: () -> Unit = {},
   modifier: Modifier = Modifier,
 ) {
   val accentColor =
@@ -179,12 +198,17 @@ fun DeckPanel(
       // Track Info & Artwork Badge
       TrackInfoDisplay(deck = deck, accentColor = accentColor)
 
-      // Waveform with Beat Grid, Hot Cues, Loop, Beat-Match Assistant & Scrubbing
+      var localWaveformZoom by rememberSaveable(deck.deckId) { mutableFloatStateOf(2.0f) }
+
+      // Waveform with Beat Grid, Hot Cues, Loop, Pinch-to-Zoom, +/- Zoom & Scrubbing
       WaveformView(
         deck = deck,
         accentColor = accentColor,
         beatMatchDeltaBpm = beatMatchDeltaBpm,
         onScratch = onScrubWaveform,
+        zoomLevel = localWaveformZoom,
+        onZoomChange = { localWaveformZoom = it.coerceIn(1.0f, 8.0f) },
+        showZoomControls = true,
         modifier = Modifier.fillMaxWidth().testTag("waveform_$tagSuffix"),
       )
 
@@ -223,6 +247,7 @@ fun DeckPanel(
               trimGain = deck.trimGain,
               accentColor = accentColor,
               onTrimChange = onTrimGainChange,
+              inputLevel = deck.inputSignalLevel,
               modifier = Modifier.testTag("trim_knob_$tagSuffix"),
             )
 
@@ -296,6 +321,14 @@ fun DeckPanel(
               testTag = "key_lock_button_$tagSuffix",
               modifier = Modifier.weight(1f),
             )
+            DeckTogglePill(
+              label = "KEY SYNC",
+              active = deck.isKeySynced,
+              accentColor = if (deck.isKeySynced) Color(0xFF00E676) else accentColor,
+              onClick = onKeySync,
+              testTag = "key_sync_button_$tagSuffix",
+              modifier = Modifier.weight(1.2f),
+            )
           }
         }
       }
@@ -335,11 +368,19 @@ fun DeckPanel(
 
         OutlinedButton(
           onClick = onSync,
-          modifier = Modifier.weight(1f).minimumInteractiveComponentSize().testTag("sync_button_$tagSuffix"),
+          modifier = Modifier.weight(1.1f).minimumInteractiveComponentSize().testTag("sync_button_$tagSuffix"),
         ) {
-          Icon(Icons.Filled.Sync, contentDescription = "Sync BPM", modifier = Modifier.size(14.dp))
+          Icon(
+            Icons.Filled.Sync,
+            contentDescription = "Auto-Sync BPM and phase",
+            tint = if (deck.isAutoSynced) Color(0xFF00E676) else accentColor,
+            modifier = Modifier.size(14.dp),
+          )
           Spacer(Modifier.width(4.dp))
-          Text("SYNC", style = MaterialTheme.typography.labelMedium)
+          Text(
+            text = if (deck.isAutoSynced) "SYNCED" else "AUTO-SYNC",
+            style = MaterialTheme.typography.labelSmall,
+          )
         }
 
         OutlinedButton(
@@ -371,6 +412,9 @@ fun DeckPanel(
         accentColor = accentColor,
         onToggleLoop = onToggleLoop,
         onCycleLoopBeats = onCycleLoopBeats,
+        onTriggerAutoLoop = onTriggerAutoLoop,
+        onHalveLoop = onHalveLoop,
+        onDoubleLoop = onDoubleLoop,
       )
 
       // 4-Stem Isolation Sliders + Mute/Solo
@@ -380,6 +424,7 @@ fun DeckPanel(
         onStemLevelChange = onStemLevelChange,
         onToggleMute = onToggleStemMute,
         onToggleSolo = onToggleStemSolo,
+        onToggleQuickIsolate = onToggleQuickIsolate,
       )
 
       // 3-Band EQ + Presets
@@ -469,6 +514,42 @@ fun BpmBeatIndicator(bpm: Float, isPlaying: Boolean, accentColor: Color) {
   )
 }
 
+object WaveformViewportMath {
+  data class ViewportWindow(
+    val zoom: Float,
+    val windowSpan: Float,
+    val startProgress: Float,
+    val endProgress: Float,
+  ) {
+    fun toViewX(progress: Float, widthPx: Float): Float =
+      ((progress - startProgress) / windowSpan) * widthPx
+  }
+
+  fun computeViewport(playheadProgress: Float, zoomLevel: Float): ViewportWindow {
+    val safeZoom = zoomLevel.coerceIn(1.0f, 8.0f)
+    val windowSpan = (1f / safeZoom).coerceIn(0.125f, 1f)
+    val halfWin = windowSpan / 2f
+    val clampedPlayhead = playheadProgress.coerceIn(0f, 1f)
+    val startProgress =
+      (clampedPlayhead - halfWin).coerceIn(0f, (1f - windowSpan).coerceAtLeast(0f))
+    val endProgress = (startProgress + windowSpan).coerceAtMost(1f)
+    return ViewportWindow(
+      zoom = safeZoom,
+      windowSpan = windowSpan,
+      startProgress = startProgress,
+      endProgress = endProgress,
+    )
+  }
+
+  fun exactTotalBeats(effectiveBpm: Float, durationSeconds: Int): Float =
+    ((effectiveBpm.coerceIn(40f, 240f) / 60f) * durationSeconds.coerceAtLeast(1)).coerceAtLeast(1f)
+
+  fun beatProgress(beatIndex: Int, effectiveBpm: Float, durationSeconds: Int): Float {
+    val beatSeconds = beatIndex * (60f / effectiveBpm.coerceIn(40f, 240f))
+    return (beatSeconds / durationSeconds.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+  }
+}
+
 @Composable
 fun WaveformView(
   deck: DeckState,
@@ -476,128 +557,24 @@ fun WaveformView(
   beatMatchDeltaBpm: Float,
   onScratch: (Float) -> Unit,
   modifier: Modifier = Modifier,
+  zoomLevel: Float = 1.0f,
+  isNeutral: Boolean = true,
+  onZoomChange: ((Float) -> Unit)? = null,
+  showZoomControls: Boolean = false,
+  compact: Boolean = false,
 ) {
-  val peaks = deck.track.waveformPeaks
-  val isBeatMatchClose = beatMatchDeltaBpm <= 3.0f
-  val matchGlowAlpha =
-    if (isBeatMatchClose) ((3.0f - beatMatchDeltaBpm) / 3.0f).coerceIn(0.25f, 1f) else 0f
-
-  val gestureModifier =
-    if (deck.scratchMode) {
-      Modifier.pointerInput(deck.deckId, deck.scratchMode) {
-        detectDragGestures { change, dragAmount ->
-          change.consume()
-          val width = size.width.coerceAtLeast(1)
-          onScratch(dragAmount.x / width)
-        }
-      }
-    } else {
-      Modifier.pointerInput(deck.deckId, deck.scratchMode) {
-        detectDragGesturesAfterLongPress { change, dragAmount ->
-          change.consume()
-          val width = size.width.coerceAtLeast(1)
-          onScratch((dragAmount.x / width) * 0.25f)
-        }
-      }
-    }
-
-  Box(
-    modifier =
-      modifier
-        .height(68.dp)
-        .clip(RoundedCornerShape(10.dp))
-        .background(Color(0xFF0A0E14))
-        .then(
-          if (isBeatMatchClose) {
-            Modifier.border(
-              width = (1.5f + matchGlowAlpha * 1.5f).dp,
-              color = Color(0xFF00E676).copy(alpha = 0.45f + matchGlowAlpha * 0.55f),
-              shape = RoundedCornerShape(10.dp),
-            )
-          } else {
-            Modifier.border(1.dp, Color(0xFF242E40), RoundedCornerShape(10.dp))
-          }
-        )
-        .then(gestureModifier)
-  ) {
-    Canvas(modifier = Modifier.fillMaxWidth().height(68.dp)) {
-      val w = size.width
-      val h = size.height
-      val centerY = h / 2f
-
-      // Active loop highlight
-      if (deck.loop.isActive && deck.loop.endProgress > deck.loop.startProgress) {
-        val startX = deck.loop.startProgress * w
-        val endX = deck.loop.endProgress * w
-        drawRect(
-          color = accentColor.copy(alpha = 0.16f),
-          topLeft = Offset(startX, 0f),
-          size = Size((endX - startX).coerceAtLeast(2f), h),
-        )
-      }
-
-      // Dynamic beat grid overlay synced to effectiveBpm
-      val totalBeats =
-        ((deck.effectiveBpm / 60f) * deck.track.durationSeconds).roundToInt().coerceIn(8, 500)
-      val beatStepPx = w / totalBeats.toFloat()
-      val drawStep = if (totalBeats > 120) 4 else 1
-      var beatIdx = 0
-      while (beatIdx < totalBeats) {
-        val x = beatIdx * beatStepPx
-        val isDownbeat = beatIdx % 4 == 0
-        drawLine(
-          color = Color.White.copy(alpha = if (isDownbeat) 0.22f else 0.08f),
-          start = Offset(x, 0f),
-          end = Offset(x, h),
-          strokeWidth = if (isDownbeat) 1.5.dp.toPx() else 1.dp.toPx(),
-        )
-        beatIdx += drawStep
-      }
-
-      // Symmetric waveform bars
-      if (peaks.isNotEmpty()) {
-        val barSlot = w / peaks.size
-        val barW = (barSlot * 0.65f).coerceAtLeast(2f)
-        peaks.forEachIndexed { idx, peak ->
-          val frac = idx.toFloat() / peaks.size
-          val barH = (peak * h * 0.78f).coerceAtLeast(4f)
-          val color = if (frac <= deck.playheadProgress) accentColor else accentColor.copy(alpha = 0.32f)
-          drawRoundRect(
-            color = color,
-            topLeft = Offset(idx * barSlot, centerY - barH / 2f),
-            size = Size(barW, barH),
-            cornerRadius = CornerRadius(2f, 2f),
-          )
-        }
-      }
-
-      // Hot cue visual indicators
-      deck.hotCues.values.forEach { cue ->
-        val cx = cue.progress.coerceIn(0f, 1f) * w
-        val cueColor = Color(cue.colorHex)
-        drawLine(
-          color = cueColor,
-          start = Offset(cx, 0f),
-          end = Offset(cx, h),
-          strokeWidth = 2.dp.toPx(),
-        )
-        drawRect(
-          color = cueColor,
-          topLeft = Offset((cx - 4.dp.toPx()).coerceAtLeast(0f), 0f),
-          size = Size(8.dp.toPx(), 6.dp.toPx()),
-        )
-      }
-
-      // Crisp playhead
-      val playheadX = deck.playheadProgress.coerceIn(0f, 1f) * w
-      drawLine(
-        color = Color.White,
-        start = Offset(playheadX, 0f),
-        end = Offset(playheadX, h),
-        strokeWidth = 2.dp.toPx(),
-      )
-    }
-  }
+  BeatSyncedWaveformDisplay(
+    deck = deck,
+    accentColor = accentColor,
+    beatMatchDeltaBpm = beatMatchDeltaBpm,
+    onScratch = onScratch,
+    modifier = modifier,
+    zoomLevel = zoomLevel,
+    isNeutral = isNeutral,
+    onZoomChange = onZoomChange,
+    showZoomControls = showZoomControls,
+    compact = compact,
+  )
 }
 
 @Composable
@@ -641,6 +618,62 @@ fun FrequencyBandVisualizer(
   }
 }
 
+data class JogWheelPhysicsConfig(
+  val rotationalInertia: Float = 1.0f,
+  val viscousFriction: Float = 3.2f,
+  val coulombFrictionDegPerSec2: Float = 45f,
+  val minCoastVelocityDegPerSec: Float = 90f,
+  val stopVelocityDegPerSec: Float = 18f,
+  val maxVelocityDegPerSec: Float = 2160f,
+)
+
+object JogWheelPhysics {
+  fun normalizeAngleDelta(deltaDeg: Float): Float {
+    var d = deltaDeg
+    while (d > 180f) d -= 360f
+    while (d < -180f) d += 360f
+    return d
+  }
+
+  fun updateAngularVelocity(
+    previousVelocityDegPerSec: Float,
+    deltaDeg: Float,
+    dtSeconds: Float,
+    config: JogWheelPhysicsConfig = JogWheelPhysicsConfig(),
+  ): Float {
+    val safeDt = dtSeconds.coerceAtLeast(0.004f)
+    val instant =
+      (deltaDeg / safeDt).coerceIn(-config.maxVelocityDegPerSec, config.maxVelocityDegPerSec)
+    val smoothing = (0.45f / config.rotationalInertia.coerceAtLeast(0.3f)).coerceIn(0.15f, 0.75f)
+    return (previousVelocityDegPerSec * (1f - smoothing) + instant * smoothing)
+      .coerceIn(-config.maxVelocityDegPerSec, config.maxVelocityDegPerSec)
+  }
+
+  /**
+   * Advances one inertial coasting step under viscous + Coulomb friction scaled by
+   * [JogWheelPhysicsConfig.rotationalInertia]. Returns (deltaAngleDeg, nextVelocityDegPerSec).
+   */
+  fun stepInertia(
+    velocityDegPerSec: Float,
+    dtSeconds: Float,
+    config: JogWheelPhysicsConfig = JogWheelPhysicsConfig(),
+  ): Pair<Float, Float> {
+    if (abs(velocityDegPerSec) < config.stopVelocityDegPerSec || dtSeconds <= 0f) {
+      return 0f to 0f
+    }
+    val inertia = config.rotationalInertia.coerceAtLeast(0.25f)
+    val safeDt = dtSeconds.coerceIn(0.001f, 0.05f)
+    val decay = exp((-config.viscousFriction / inertia) * safeDt)
+    val damped = velocityDegPerSec * decay
+    val sign = if (damped >= 0f) 1f else -1f
+    val afterCoulomb =
+      (abs(damped) - (config.coulombFrictionDegPerSec2 / inertia) * safeDt).coerceAtLeast(0f)
+    val nextVelocity = if (afterCoulomb < config.stopVelocityDegPerSec) 0f else sign * afterCoulomb
+    val avgVelocity = (velocityDegPerSec + nextVelocity) * 0.5f
+    return (avgVelocity * safeDt) to nextVelocity
+  }
+}
+
 @Composable
 fun VinylJogWheel(
   rotationDeg: Float,
@@ -649,8 +682,16 @@ fun VinylJogWheel(
   onTap: () -> Unit,
   onRotate: (Float) -> Unit,
   modifier: Modifier = Modifier,
+  physicsConfig: JogWheelPhysicsConfig = JogWheelPhysicsConfig(),
 ) {
+  val scope = rememberCoroutineScope()
+  val latestOnRotate by rememberUpdatedState(onRotate)
+  val latestConfig by rememberUpdatedState(physicsConfig)
   var lastAngle by remember { mutableStateOf<Float?>(null) }
+  var lastTouchTimeMs by remember { mutableStateOf(0L) }
+  var angularVelocity by remember { mutableFloatStateOf(0f) }
+  var coastJob by remember { mutableStateOf<Job?>(null) }
+  var coastSpeedVisual by remember { mutableFloatStateOf(0f) }
 
   Box(
     modifier =
@@ -659,14 +700,61 @@ fun VinylJogWheel(
         .clip(CircleShape)
         .clickable(onClick = onTap)
         .pointerInput(Unit) {
+          awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            coastJob?.cancel()
+            coastJob = null
+            coastSpeedVisual = 0f
+          }
+        }
+        .pointerInput(Unit) {
           detectDragGestures(
             onDragStart = { offset ->
+              coastJob?.cancel()
+              coastJob = null
+              coastSpeedVisual = 0f
+              angularVelocity = 0f
+              lastTouchTimeMs = 0L
               val cx = size.width / 2f
               val cy = size.height / 2f
               lastAngle = atan2(offset.y - cy, offset.x - cx) * (180f / PI.toFloat())
             },
-            onDragEnd = { lastAngle = null },
-            onDragCancel = { lastAngle = null },
+            onDragEnd = {
+              lastAngle = null
+              val launchVel = angularVelocity
+              if (abs(launchVel) >= latestConfig.minCoastVelocityDegPerSec) {
+                coastJob =
+                  scope.launch {
+                    var vel = launchVel
+                    var prevNanos = 0L
+                    while (abs(vel) >= latestConfig.stopVelocityDegPerSec) {
+                      val dtSec =
+                        withFrameNanos { frameNanos ->
+                          val dt =
+                            if (prevNanos == 0L) 0.016f
+                            else ((frameNanos - prevNanos) / 1_000_000_000f).coerceIn(0.004f, 0.05f)
+                          prevNanos = frameNanos
+                          dt
+                        }
+                      val (deltaStep, nextVel) =
+                        JogWheelPhysics.stepInertia(vel, dtSec, latestConfig)
+                      vel = nextVel
+                      coastSpeedVisual = abs(vel)
+                      if (deltaStep != 0f) {
+                        latestOnRotate(deltaStep)
+                      }
+                    }
+                    coastSpeedVisual = 0f
+                    angularVelocity = 0f
+                  }
+              }
+              angularVelocity = 0f
+            },
+            onDragCancel = {
+              lastAngle = null
+              angularVelocity = 0f
+              coastSpeedVisual = 0f
+            },
           ) { change, _ ->
             change.consume()
             val cx = size.width / 2f
@@ -674,17 +762,31 @@ fun VinylJogWheel(
             val currentAngle =
               atan2(change.position.y - cy, change.position.x - cx) * (180f / PI.toFloat())
             val prev = lastAngle
+            val nowMs = change.uptimeMillis
             if (prev != null) {
-              var delta = currentAngle - prev
-              if (delta > 180f) delta -= 360f
-              if (delta < -180f) delta += 360f
-              onRotate(delta)
+              val delta = JogWheelPhysics.normalizeAngleDelta(currentAngle - prev)
+              val dtSec =
+                if (lastTouchTimeMs > 0L && nowMs > lastTouchTimeMs) {
+                  (nowMs - lastTouchTimeMs) / 1000f
+                } else {
+                  0.016f
+                }
+              angularVelocity =
+                JogWheelPhysics.updateAngularVelocity(
+                  previousVelocityDegPerSec = angularVelocity,
+                  deltaDeg = delta,
+                  dtSeconds = dtSec,
+                  config = latestConfig,
+                )
+              latestOnRotate(delta)
             }
             lastAngle = currentAngle
+            lastTouchTimeMs = nowMs
           }
         },
     contentAlignment = Alignment.Center,
   ) {
+    val inertiaGlow = (coastSpeedVisual / 720f).coerceIn(0f, 1f)
     Canvas(modifier = Modifier.size(94.dp)) {
       val cx = size.width / 2f
       val cy = size.height / 2f
@@ -692,9 +794,11 @@ fun VinylJogWheel(
 
       drawCircle(color = Color(0xFF10151E), radius = radius)
       drawCircle(
-        color = if (isPlaying) accentColor else Color(0xFF39465D),
+        color =
+          if (isPlaying || inertiaGlow > 0.05f) accentColor.copy(alpha = (0.75f + inertiaGlow * 0.25f).coerceIn(0f, 1f))
+          else Color(0xFF39465D),
         radius = radius - 3.dp.toPx(),
-        style = Stroke(width = 3.dp.toPx()),
+        style = Stroke(width = (3f + inertiaGlow * 1.5f).dp.toPx()),
       )
       drawCircle(
         color = Color(0xFF1D2534),
@@ -702,7 +806,7 @@ fun VinylJogWheel(
         style = Stroke(width = 1.5.dp.toPx()),
       )
       drawCircle(
-        color = accentColor.copy(alpha = 0.25f),
+        color = accentColor.copy(alpha = 0.25f + inertiaGlow * 0.2f),
         radius = radius * 0.34f,
       )
 

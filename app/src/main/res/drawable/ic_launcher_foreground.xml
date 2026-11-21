@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/ic_stemdeck_launcher_1794518436973"
+        android:drawable="@drawable/ic_serato_vinyl_launcher"
         android:gravity="center" />
 </layer-list>

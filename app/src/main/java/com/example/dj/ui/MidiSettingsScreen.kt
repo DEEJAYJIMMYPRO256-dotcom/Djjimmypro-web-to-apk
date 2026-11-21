@@ -48,6 +48,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,10 +75,10 @@ fun MidiSettingsScreen(
   val mappings by midiManager.mappings.collectAsStateWithLifecycle()
   val latencyOffsetMs by midiManager.latencyOffsetMs.collectAsStateWithLifecycle()
 
-  var learningAction by remember { mutableStateOf<MidiAction?>(null) }
-  var presetName by remember { mutableStateOf("") }
-  var measuredLatencyMs by remember { mutableStateOf<Float?>(null) }
-  var statusBanner by remember { mutableStateOf<String?>(null) }
+  var learningAction by rememberSaveable { mutableStateOf<MidiAction?>(null) }
+  var presetName by rememberSaveable { mutableStateOf("") }
+  var measuredLatencyMs by rememberSaveable { mutableStateOf<Float?>(null) }
+  var statusBanner by rememberSaveable { mutableStateOf<String?>(null) }
 
   val presetsDir = remember { File(context.filesDir, "midi_presets").apply { mkdirs() } }
   var savedPresets by remember {

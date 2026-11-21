@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "StemDeck DJ"
+rootProject.name = "Serato Dj Pro"
 
 include(":app")

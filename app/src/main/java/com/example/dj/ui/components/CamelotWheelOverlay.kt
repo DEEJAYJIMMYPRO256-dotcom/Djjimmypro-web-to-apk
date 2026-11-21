@@ -26,55 +26,25 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.dj.model.CamelotKeyMath
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
 object CamelotHelper {
-  private val keyMap =
-    mapOf(
-      "Am" to "8A",
-      "C" to "8B",
-      "Em" to "9A",
-      "G" to "9B",
-      "Bm" to "10A",
-      "D" to "10B",
-      "F#m" to "11A",
-      "A" to "11B",
-      "C#m" to "12A",
-      "E" to "12B",
-      "G#m" to "1A",
-      "B" to "1B",
-      "D#m" to "2A",
-      "F#" to "2B",
-      "Bbm" to "3A",
-      "Db" to "3B",
-      "Fm" to "4A",
-      "Ab" to "4B",
-      "Cm" to "5A",
-      "Eb" to "5B",
-      "Gm" to "6A",
-      "Bb" to "6B",
-      "Dm" to "7A",
-      "F" to "7B",
-    )
+  fun toCamelot(musicalKey: String): String = CamelotKeyMath.toCamelot(musicalKey)
 
-  fun toCamelot(musicalKey: String): String = keyMap[musicalKey] ?: "8A"
+  fun compatibleCamelotKeys(camelotKey: String): Set<String> =
+    CamelotKeyMath.compatibleCamelotKeys(camelotKey)
 
-  fun compatibleCamelotKeys(camelotKey: String): Set<String> {
-    val num = camelotKey.dropLast(1).toIntOrNull() ?: return setOf(camelotKey)
-    val letter = camelotKey.lastOrNull() ?: 'A'
-    val prev = if (num == 1) 12 else num - 1
-    val next = if (num == 12) 1 else num + 1
-    val otherLetter = if (letter == 'A') 'B' else 'A'
-    return setOf("$num$letter", "$prev$letter", "$next$letter", "$num$otherLetter")
-  }
+  fun isCompatible(referenceMusicalKey: String, candidateMusicalKey: String): Boolean =
+    CamelotKeyMath.isCompatible(referenceMusicalKey, candidateMusicalKey)
 
-  fun isCompatible(referenceMusicalKey: String, candidateMusicalKey: String): Boolean {
-    val refCam = toCamelot(referenceMusicalKey)
-    val candCam = toCamelot(candidateMusicalKey)
-    return candCam in compatibleCamelotKeys(refCam)
-  }
+  fun transposeMusicalKey(musicalKey: String, semitones: Int): String =
+    CamelotKeyMath.transposeMusicalKey(musicalKey, semitones)
+
+  fun calculateKeySyncSemitones(sourceMusicalKey: String, targetMusicalKey: String): Int =
+    CamelotKeyMath.calculateKeySyncSemitones(sourceMusicalKey, targetMusicalKey)
 }
 
 @Composable

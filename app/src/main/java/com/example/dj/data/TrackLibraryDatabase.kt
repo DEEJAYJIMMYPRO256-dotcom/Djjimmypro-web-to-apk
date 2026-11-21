@@ -24,6 +24,7 @@ data class TrackEntity(
   val baseFreqHz: Float = 220f,
   val filePath: String? = null,
   val beatGridJson: String = "[]",
+  val waveformPeaksJson: String = "[]",
   val addedAtMs: Long = System.currentTimeMillis(),
 )
 
@@ -95,7 +96,7 @@ interface EqPresetDao {
 
 @Database(
   entities = [TrackEntity::class, SessionHistoryEntity::class, EqPresetEntity::class],
-  version = 4,
+  version = 5,
   exportSchema = false,
 )
 abstract class TrackLibraryDatabase : RoomDatabase() {

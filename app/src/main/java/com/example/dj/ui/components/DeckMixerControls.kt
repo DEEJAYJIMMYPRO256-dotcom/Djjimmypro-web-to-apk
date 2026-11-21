@@ -6,19 +6,25 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -26,20 +32,35 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.dj.model.DeckState
 import com.example.dj.model.EqBand
 import com.example.dj.model.EqPreset
 import com.example.dj.model.StemType
+import com.example.dj.model.TrimGainMath
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -86,50 +107,235 @@ fun RotaryTrimKnob(
   accentColor: Color,
   onTrimChange: (Float) -> Unit,
   modifier: Modifier = Modifier,
+  label: String = "GAIN TRIM",
+  inputLevel: Float = 0f,
+  showInputMeter: Boolean = true,
+  compact: Boolean = false,
+  tagSuffix: String? = null,
 ) {
+  val clamped = TrimGainMath.clamp(trimGain)
+  val dbText = TrimGainMath.formatDb(clamped)
+  val isUnity = abs(clamped - TrimGainMath.UNITY_TRIM) < 0.03f
+  val isClipping = inputLevel >= 0.85f || clamped >= 1.55f
+  val isHot = clamped > 1.25f || inputLevel >= 0.65f
+  val readoutColor =
+    when {
+      isClipping -> Color(0xFFFF3B5C)
+      isHot -> Color(0xFFFFB300)
+      isUnity -> Color(0xFFE2E8F0)
+      else -> accentColor
+    }
+  val latestTrim by rememberUpdatedState(clamped)
+  val latestOnTrimChange by rememberUpdatedState(onTrimChange)
+
   Column(
-    modifier = modifier,
+    modifier =
+      modifier
+        .semantics {
+          contentDescription = "$label rotary gain trim"
+          stateDescription = "$dbText, input level ${(inputLevel.coerceIn(0f, 1f) * 100f).roundToInt()} percent"
+          progressBarRangeInfo =
+            ProgressBarRangeInfo(clamped, TrimGainMath.MIN_TRIM..TrimGainMath.MAX_TRIM)
+          setProgress { target ->
+            latestOnTrimChange(TrimGainMath.clamp(target))
+            true
+          }
+        }
+        .pointerInput(Unit) {
+          detectDragGestures { change, dragAmount ->
+            change.consume()
+            // Dragging up or right increases gain; dragging down or left attenuates gain
+            val delta = (-dragAmount.y + dragAmount.x * 0.65f) * 0.0055f
+            latestOnTrimChange(TrimGainMath.clamp(latestTrim + delta))
+          }
+        },
     horizontalAlignment = Alignment.CenterHorizontally,
     verticalArrangement = Arrangement.spacedBy(2.dp),
   ) {
     Text(
-      text = "TRIM",
+      text = label,
       style = MaterialTheme.typography.labelSmall,
+      fontSize = if (compact) 9.sp else 10.sp,
+      fontWeight = FontWeight.Bold,
       color = MaterialTheme.colorScheme.onSurfaceVariant,
+      maxLines = 1,
+      overflow = TextOverflow.Ellipsis,
     )
-    Box(
-      modifier =
-        Modifier.size(48.dp)
-          .clip(CircleShape)
-          .pointerInput(trimGain) {
-            detectVerticalDragGestures { change, dragAmount ->
-              change.consume()
-              onTrimChange((trimGain - dragAmount * 0.006f).coerceIn(0.2f, 1.8f))
-            }
-          },
-      contentAlignment = Alignment.Center,
+
+    Row(
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp),
     ) {
-      Canvas(modifier = Modifier.size(40.dp)) {
-        val cx = size.width / 2f
-        val cy = size.height / 2f
-        val r = size.minDimension / 2f
-        drawCircle(color = Color(0xFF1A2230), radius = r)
-        drawCircle(
-          color = accentColor.copy(alpha = 0.7f),
-          radius = r - 2.dp.toPx(),
-          style = Stroke(width = 2.dp.toPx()),
-        )
-        val norm = ((trimGain - 0.2f) / 1.6f).coerceIn(0f, 1f)
-        val angleDeg = -225f + norm * 270f
-        val rad = angleDeg * (PI / 180.0)
-        val end = Offset(cx + (r * 0.75f) * cos(rad).toFloat(), cy + (r * 0.75f) * sin(rad).toFloat())
-        drawLine(color = Color.White, start = Offset(cx, cy), end = end, strokeWidth = 2.5.dp.toPx())
+      val touchSize = if (compact) 48.dp else 52.dp
+      val dialSize = if (compact) 40.dp else 44.dp
+      Box(
+        modifier =
+          Modifier.size(touchSize)
+            .clip(CircleShape)
+            .pointerInput(Unit) {
+              detectTapGestures(
+                onDoubleTap = { latestOnTrimChange(TrimGainMath.UNITY_TRIM) },
+              )
+            },
+        contentAlignment = Alignment.Center,
+      ) {
+        Canvas(modifier = Modifier.size(dialSize)) {
+          val cx = size.width / 2f
+          val cy = size.height / 2f
+          val outerR = size.minDimension / 2f
+          val knobR = outerR * 0.78f
+          val norm =
+            ((clamped - TrimGainMath.MIN_TRIM) /
+              (TrimGainMath.MAX_TRIM - TrimGainMath.MIN_TRIM)).coerceIn(0f, 1f)
+          val unityAngleDeg = -90f // 12 o'clock = 1.0x (0.0 dB)
+          val sweepStart = -225f
+          val sweepTotal = 270f
+          val currentAngleDeg = sweepStart + norm * sweepTotal
+
+          // 11 calibrated dial ticks around the 270-degree arc
+          for (tick in 0..10) {
+            val tickFrac = tick / 10f
+            val deg = sweepStart + tickFrac * sweepTotal
+            val rad = deg * (PI / 180.0)
+            val isCenterTick = tick == 5
+            val innerTickR = outerR * (if (isCenterTick) 0.80f else 0.85f)
+            val tickColor =
+              when {
+                isCenterTick -> Color(0xFFE2E8F0)
+                tick >= 8 -> Color(0xFFFFB300).copy(alpha = 0.75f)
+                else -> Color(0xFF475569)
+              }
+            drawLine(
+              color = tickColor,
+              start =
+                Offset(
+                  cx + innerTickR * cos(rad).toFloat(),
+                  cy + innerTickR * sin(rad).toFloat(),
+                ),
+              end =
+                Offset(
+                  cx + outerR * cos(rad).toFloat(),
+                  cy + outerR * sin(rad).toFloat(),
+                ),
+              strokeWidth = if (isCenterTick) 2.dp.toPx() else 1.2.dp.toPx(),
+              cap = StrokeCap.Round,
+            )
+          }
+
+          // Background track arc + bipolar boost/cut arc from 0 dB center
+          val arcInset = outerR * 0.12f
+          val arcSize = Size(size.width - arcInset * 2f, size.height - arcInset * 2f)
+          drawArc(
+            color = Color(0xFF1F2937),
+            startAngle = sweepStart,
+            sweepAngle = sweepTotal,
+            useCenter = false,
+            topLeft = Offset(arcInset, arcInset),
+            size = arcSize,
+            style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round),
+          )
+          val arcSweep = currentAngleDeg - unityAngleDeg
+          if (abs(arcSweep) > 1.5f) {
+            drawArc(
+              color = if (isClipping) Color(0xFFFF3B5C) else accentColor,
+              startAngle = unityAngleDeg,
+              sweepAngle = arcSweep,
+              useCenter = false,
+              topLeft = Offset(arcInset, arcInset),
+              size = arcSize,
+              style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round),
+            )
+          }
+
+          // Hardware rotary cap body
+          drawCircle(
+            brush =
+              Brush.radialGradient(
+                colors = listOf(Color(0xFF333D4E), Color(0xFF131923)),
+                center = Offset(cx - knobR * 0.25f, cy - knobR * 0.25f),
+                radius = knobR * 1.4f,
+              ),
+            radius = knobR,
+            center = Offset(cx, cy),
+          )
+          drawCircle(
+            color = readoutColor.copy(alpha = 0.75f),
+            radius = knobR - 1.dp.toPx(),
+            center = Offset(cx, cy),
+            style = Stroke(width = 1.4.dp.toPx()),
+          )
+
+          // Pointer needle
+          val rad = currentAngleDeg * (PI / 180.0)
+          val start =
+            Offset(
+              cx + (knobR * 0.22f) * cos(rad).toFloat(),
+              cy + (knobR * 0.22f) * sin(rad).toFloat(),
+            )
+          val end =
+            Offset(
+              cx + (knobR * 0.84f) * cos(rad).toFloat(),
+              cy + (knobR * 0.84f) * sin(rad).toFloat(),
+            )
+          drawLine(
+            color = Color.White,
+            start = start,
+            end = end,
+            strokeWidth = 2.4.dp.toPx(),
+            cap = StrokeCap.Round,
+          )
+        }
+      }
+
+      if (showInputMeter) {
+        val meterModifier =
+          if (tagSuffix != null) {
+            Modifier.width(6.dp).height(if (compact) 34.dp else 40.dp).testTag("input_level_meter_$tagSuffix")
+          } else {
+            Modifier.width(6.dp).height(if (compact) 34.dp else 40.dp)
+          }
+        Canvas(modifier = meterModifier) {
+          val segments = 8
+          val gap = 1.5.dp.toPx()
+          val segH = (size.height - gap * (segments - 1)) / segments
+          val lit = (inputLevel.coerceIn(0f, 1f) * segments).roundToInt()
+          for (i in 0 until segments) {
+            val fromBottom = segments - 1 - i
+            val frac = (fromBottom + 1).toFloat() / segments
+            val baseCol =
+              when {
+                frac >= 0.85f -> Color(0xFFFF3B5C)
+                frac >= 0.62f -> Color(0xFFFFB300)
+                else -> Color(0xFF00E676)
+              }
+            val color = if (fromBottom < lit) baseCol else baseCol.copy(alpha = 0.18f)
+            drawRoundRect(
+              color = color,
+              topLeft = Offset(0f, i * (segH + gap)),
+              size = Size(size.width, segH),
+              cornerRadius = CornerRadius(2f, 2f),
+            )
+          }
+        }
       }
     }
+
+    val badgeModifier =
+      Modifier.clip(RoundedCornerShape(4.dp))
+        .background(Color(0xFF0E141E))
+        .border(1.dp, readoutColor.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+        .clickable { onTrimChange(TrimGainMath.UNITY_TRIM) }
+        .padding(horizontal = 5.dp, vertical = 1.dp)
+        .let { if (tagSuffix != null) it.testTag("mixer_trim_db_$tagSuffix") else it }
+
     Text(
-      text = "${String.format("%.2f", trimGain)}x",
+      text = dbText,
       style = MaterialTheme.typography.labelSmall,
-      color = accentColor,
+      fontSize = if (compact) 9.sp else 10.sp,
+      fontWeight = FontWeight.Bold,
+      color = readoutColor,
+      maxLines = 1,
+      modifier = badgeModifier,
     )
   }
 }
@@ -184,59 +390,164 @@ fun LoopControlsRow(
   accentColor: Color,
   onToggleLoop: () -> Unit,
   onCycleLoopBeats: () -> Unit,
+  onTriggerAutoLoop: (Float) -> Unit = {},
+  onHalveLoop: () -> Unit = {},
+  onDoubleLoop: () -> Unit = {},
 ) {
+  val tagSuffix = deck.deckId.name
   val beatLabel =
     when (deck.loop.beats) {
-      0.25f -> "1/4 BT"
-      0.5f -> "1/2 BT"
-      else -> "${deck.loop.beats.toInt()} BT"
+      0.25f -> "1/4B"
+      0.5f -> "1/2B"
+      else -> "${deck.loop.beats.toInt()}B"
     }
-  Row(
-    modifier = Modifier.fillMaxWidth(),
-    horizontalArrangement = Arrangement.spacedBy(8.dp),
-  ) {
-    Surface(
-      shape = RoundedCornerShape(8.dp),
-      color =
-        if (deck.loop.isActive) accentColor.copy(alpha = 0.24f)
-        else MaterialTheme.colorScheme.surfaceVariant,
-      modifier =
-        Modifier.weight(1.3f)
-          .minimumInteractiveComponentSize()
-          .clip(RoundedCornerShape(8.dp))
-          .border(
-            1.dp,
-            if (deck.loop.isActive) accentColor else Color(0xFF2D384C),
-            RoundedCornerShape(8.dp),
-          )
-          .clickable(onClick = onToggleLoop)
-          .testTag("loop_button_${deck.deckId.name}"),
-    ) {
-      Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 8.dp)) {
-        Text(
-          text = if (deck.loop.isActive) "LOOP ON" else "AUTO LOOP",
-          style = MaterialTheme.typography.labelMedium,
-          color = if (deck.loop.isActive) accentColor else MaterialTheme.colorScheme.onSurface,
-        )
-      }
-    }
+  val is4BeatActive = deck.loop.isActive && kotlin.math.abs(deck.loop.beats - 4f) < 0.05f
+  val is8BeatActive = deck.loop.isActive && kotlin.math.abs(deck.loop.beats - 8f) < 0.05f
 
-    Surface(
-      shape = RoundedCornerShape(8.dp),
-      color = MaterialTheme.colorScheme.surfaceVariant,
-      modifier =
-        Modifier.weight(1f)
-          .minimumInteractiveComponentSize()
-          .clip(RoundedCornerShape(8.dp))
-          .clickable(onClick = onCycleLoopBeats)
-          .testTag("loop_beats_${deck.deckId.name}"),
+  Column(
+    modifier = Modifier.fillMaxWidth(),
+    verticalArrangement = Arrangement.spacedBy(5.dp),
+  ) {
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.spacedBy(5.dp),
     ) {
-      Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 8.dp)) {
-        Text(
-          text = beatLabel,
-          style = MaterialTheme.typography.labelMedium,
-          color = accentColor,
-        )
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color =
+          if (deck.loop.isActive) accentColor.copy(alpha = 0.24f)
+          else MaterialTheme.colorScheme.surfaceVariant,
+        modifier =
+          Modifier.weight(1.15f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(
+              1.dp,
+              if (deck.loop.isActive) accentColor else Color(0xFF2D384C),
+              RoundedCornerShape(7.dp),
+            )
+            .clickable(onClick = onToggleLoop)
+            .testTag("loop_button_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = if (deck.loop.isActive) "LOOP ON" else "LOOP",
+            style = MaterialTheme.typography.labelSmall,
+            color = if (deck.loop.isActive) accentColor else MaterialTheme.colorScheme.onSurface,
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color =
+          if (is4BeatActive) accentColor.copy(alpha = 0.26f)
+          else MaterialTheme.colorScheme.surfaceVariant,
+        modifier =
+          Modifier.weight(0.9f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(
+              1.dp,
+              if (is4BeatActive) accentColor else Color(0xFF2D384C),
+              RoundedCornerShape(7.dp),
+            )
+            .clickable { onTriggerAutoLoop(4f) }
+            .testTag("loop_4_button_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = "4 BEAT",
+            style = MaterialTheme.typography.labelSmall,
+            color = if (is4BeatActive) accentColor else MaterialTheme.colorScheme.onSurface,
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color =
+          if (is8BeatActive) accentColor.copy(alpha = 0.26f)
+          else MaterialTheme.colorScheme.surfaceVariant,
+        modifier =
+          Modifier.weight(0.9f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(
+              1.dp,
+              if (is8BeatActive) accentColor else Color(0xFF2D384C),
+              RoundedCornerShape(7.dp),
+            )
+            .clickable { onTriggerAutoLoop(8f) }
+            .testTag("loop_8_button_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = "8 BEAT",
+            style = MaterialTheme.typography.labelSmall,
+            color = if (is8BeatActive) accentColor else MaterialTheme.colorScheme.onSurface,
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier =
+          Modifier.weight(0.65f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(1.dp, Color(0xFF2D384C), RoundedCornerShape(7.dp))
+            .clickable(onClick = onHalveLoop)
+            .testTag("loop_half_button_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = "1/2x",
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFFD5DFF0),
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier =
+          Modifier.weight(0.65f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(1.dp, Color(0xFF2D384C), RoundedCornerShape(7.dp))
+            .clickable(onClick = onDoubleLoop)
+            .testTag("loop_double_button_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = "2x",
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFFD5DFF0),
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(7.dp),
+        color = Color(0xFF151C28),
+        modifier =
+          Modifier.weight(0.75f)
+            .minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(7.dp))
+            .border(1.dp, accentColor.copy(alpha = 0.5f), RoundedCornerShape(7.dp))
+            .clickable(onClick = onCycleLoopBeats)
+            .testTag("loop_beats_$tagSuffix"),
+      ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(vertical = 7.dp)) {
+          Text(
+            text = beatLabel,
+            style = MaterialTheme.typography.labelSmall,
+            color = accentColor,
+          )
+        }
       }
     }
   }
@@ -249,13 +560,93 @@ fun StemsControlPanel(
   onStemLevelChange: (StemType, Float) -> Unit,
   onToggleMute: (StemType) -> Unit,
   onToggleSolo: (StemType) -> Unit,
+  onToggleQuickIsolate: () -> Unit = {},
 ) {
+  val quickIsolateOn = deck.quickIsolateEnabled
+  val karaokeActive = deck.isQuickIsolateActive
+
   Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-    Text(
-      text = "4-STEM ISOLATION",
-      style = MaterialTheme.typography.labelSmall,
-      color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Column {
+        Text(
+          text = "4-STEM ISOLATION",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (quickIsolateOn) {
+          Text(
+            text =
+              if (karaokeActive) {
+                "KARAOKE ACTIVE • VOX 0% + HPF ${(deck.effects.filter * 100).roundToInt()}%"
+              } else {
+                "Tap VOX Mute (M) for instant karaoke HPF"
+              },
+            style = MaterialTheme.typography.labelSmall,
+            color = if (karaokeActive) Color(0xFF00E676) else accentColor,
+            modifier = Modifier.testTag("stem_quick_isolate_status_${deck.deckId.name}"),
+          )
+        }
+      }
+
+      Surface(
+        shape = RoundedCornerShape(8.dp),
+        color =
+          when {
+            karaokeActive -> Color(0xFF00E676).copy(alpha = 0.24f)
+            quickIsolateOn -> accentColor.copy(alpha = 0.22f)
+            else -> MaterialTheme.colorScheme.surfaceVariant
+          },
+        modifier =
+          Modifier.minimumInteractiveComponentSize()
+            .clip(RoundedCornerShape(8.dp))
+            .border(
+              width = 1.dp,
+              color =
+                when {
+                  karaokeActive -> Color(0xFF00E676)
+                  quickIsolateOn -> accentColor
+                  else -> Color(0xFF2D384C)
+                },
+              shape = RoundedCornerShape(8.dp),
+            )
+            .clickable(onClick = onToggleQuickIsolate)
+            .testTag("stem_quick_isolate_${deck.deckId.name}"),
+      ) {
+        Row(
+          modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Icon(
+            imageVector = Icons.Filled.GraphicEq,
+            contentDescription = "Quick Isolate Karaoke Mode",
+            tint =
+              when {
+                karaokeActive -> Color(0xFF00E676)
+                quickIsolateOn -> accentColor
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+              },
+            modifier = Modifier.size(13.dp),
+          )
+          Spacer(Modifier.width(4.dp))
+          Text(
+            text = if (karaokeActive) "QUICK ISOLATE • ON" else "QUICK ISOLATE",
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            color =
+              when {
+                karaokeActive -> Color(0xFF00E676)
+                quickIsolateOn -> accentColor
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+              },
+          )
+        }
+      }
+    }
+
     Row(
       modifier = Modifier.fillMaxWidth(),
       horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -265,6 +656,7 @@ fun StemsControlPanel(
         val level = state?.level ?: 1f
         val isMuted = state?.isMuted ?: false
         val isSolo = state?.isSolo ?: false
+        val isVocalsQuickArmed = stem == StemType.VOCALS && quickIsolateOn
 
         Surface(
           shape = RoundedCornerShape(10.dp),
@@ -273,7 +665,11 @@ fun StemsControlPanel(
             Modifier.weight(1f)
               .border(
                 1.dp,
-                if (isSolo) accentColor else Color(0xFF2B3445),
+                when {
+                  isVocalsQuickArmed && isMuted -> Color(0xFF00E676)
+                  isSolo || isVocalsQuickArmed -> accentColor
+                  else -> Color(0xFF2B3445)
+                },
                 RoundedCornerShape(10.dp),
               ),
         ) {
@@ -283,9 +679,14 @@ fun StemsControlPanel(
             verticalArrangement = Arrangement.spacedBy(4.dp),
           ) {
             Text(
-              text = stem.shortLabel,
+              text = if (isVocalsQuickArmed) "${stem.shortLabel}•HPF" else stem.shortLabel,
               style = MaterialTheme.typography.labelMedium,
-              color = if (isMuted) Color(0xFFFF3B5C) else accentColor,
+              color =
+                when {
+                  isVocalsQuickArmed && isMuted -> Color(0xFF00E676)
+                  isMuted -> Color(0xFFFF3B5C)
+                  else -> accentColor
+                },
             )
             Slider(
               value = level,
@@ -475,12 +876,15 @@ fun EffectsControlRow(
         Text(
           text =
             when {
-              deck.effects.filter < -0.05f -> "LPF"
-              deck.effects.filter > 0.05f -> "HPF"
+              deck.effects.filter < -0.05f -> "LPF ${(-deck.effects.filter * 100).roundToInt()}%"
+              deck.effects.filter > 0.05f -> "HPF ${(deck.effects.filter * 100).roundToInt()}%"
               else -> "FILTER"
             },
           style = MaterialTheme.typography.labelSmall,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          color =
+            if (deck.effects.filter > 0.05f || deck.effects.filter < -0.05f) accentColor
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.testTag("fx_filter_label_${deck.deckId.name}"),
         )
         Slider(
           value = deck.effects.filter,

@@ -76,6 +76,44 @@ object BpmSyncEngine {
     return rawOffset.coerceIn(-maxRange, maxRange)
   }
 
+  /**
+   * Aligns source deck playhead beat-phase to match target deck's current beat phase while
+   * keeping the source deck near its current track position (within +/- 0.5 beats).
+   */
+  fun calculatePhaseAlignedProgress(
+    sourcePlayheadProgress: Float,
+    sourceSyncedBpm: Float,
+    sourceDurationSeconds: Int,
+    targetPlayheadProgress: Float,
+    targetEffectiveBpm: Float,
+    targetDurationSeconds: Int,
+  ): Float {
+    if (
+      sourceSyncedBpm <= 0f ||
+        sourceDurationSeconds <= 0 ||
+        targetEffectiveBpm <= 0f ||
+        targetDurationSeconds <= 0
+    ) {
+      return sourcePlayheadProgress.coerceIn(0f, 1f)
+    }
+    val targetTimeSec = targetPlayheadProgress.coerceIn(0f, 1f) * targetDurationSeconds
+    val targetTotalBeats = targetTimeSec * (targetEffectiveBpm / 60f)
+    val targetBeatPhase = targetTotalBeats - kotlin.math.floor(targetTotalBeats)
+
+    val sourceTimeSec = sourcePlayheadProgress.coerceIn(0f, 1f) * sourceDurationSeconds
+    val sourceTotalBeats = sourceTimeSec * (sourceSyncedBpm / 60f)
+    val sourceBeatIndex = kotlin.math.floor(sourceTotalBeats)
+    val sourceBeatPhase = sourceTotalBeats - sourceBeatIndex
+
+    var phaseDelta = targetBeatPhase - sourceBeatPhase
+    if (phaseDelta > 0.5f) phaseDelta -= 1f
+    if (phaseDelta < -0.5f) phaseDelta += 1f
+
+    val alignedTotalBeats = (sourceTotalBeats + phaseDelta).coerceAtLeast(0f)
+    val alignedTimeSec = alignedTotalBeats * (60f / sourceSyncedBpm)
+    return (alignedTimeSec / sourceDurationSeconds.toFloat()).coerceIn(0f, 1f)
+  }
+
   class TapTempoTracker {
     private val timestamps = mutableListOf<Long>()
 
@@ -98,6 +136,51 @@ object BpmSyncEngine {
 
     fun reset() {
       timestamps.clear()
+    }
+  }
+
+  enum class TapSource(val label: String) {
+    DECK_A("DECK 1"),
+    DECK_B("DECK 2"),
+    MASTER("MASTER"),
+  }
+
+  class MasterTapTempoAggregator {
+    private data class TapSample(val source: TapSource, val timestampMs: Long)
+
+    private val samples = mutableListOf<TapSample>()
+
+    fun recordTap(source: TapSource, nowMs: Long = System.currentTimeMillis()): Float? {
+      if (samples.isNotEmpty() && nowMs - samples.last().timestampMs > 2000L) {
+        samples.clear()
+      }
+      samples.add(TapSample(source, nowMs))
+      if (samples.size > 8) {
+        samples.removeAt(0)
+      }
+      if (samples.size < 2) return null
+      val intervals = mutableListOf<Long>()
+      for (i in 1 until samples.size) {
+        intervals.add(samples[i].timestampMs - samples[i - 1].timestampMs)
+      }
+      val avgIntervalMs = intervals.average().toFloat().coerceAtLeast(250f)
+      return (60_000f / avgIntervalMs).coerceIn(60f, 190f)
+    }
+
+    fun sourceSummary(): String? {
+      if (samples.isEmpty()) return null
+      val distinct = samples.map { it.source }.toSet()
+      return when {
+        TapSource.DECK_A in distinct && TapSource.DECK_B in distinct -> "A+B"
+        distinct.size > 1 -> "SYNC"
+        else -> distinct.first().label
+      }
+    }
+
+    fun tapCount(): Int = samples.size
+
+    fun reset() {
+      samples.clear()
     }
   }
 }

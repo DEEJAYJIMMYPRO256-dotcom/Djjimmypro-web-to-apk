@@ -1,20 +1,23 @@
 package com.example.dj.ui
 
 import android.app.Application
-import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.dj.audio.AudioDecoder
 import com.example.dj.audio.AudioEngine
 import com.example.dj.audio.BpmSyncEngine
+import com.example.dj.audio.SamplePadAudioEngine
 import com.example.dj.audio.StemAudioEngine
+import com.example.dj.data.BundledAndLocalTrackScanner
 import com.example.dj.data.TrackLibraryDatabase
 import com.example.dj.data.TrackLibraryRepository
 import com.example.dj.input.DjKeyboardShortcuts
 import com.example.dj.input.DjShortcutCommand
 import com.example.dj.midi.MidiAction
 import com.example.dj.midi.MidiControllerManager
+import com.example.dj.model.BeatSyncedWaveformMath
+import com.example.dj.model.CamelotKeyMath
 import com.example.dj.model.DeckEffectsState
 import com.example.dj.model.DeckId
 import com.example.dj.model.DeckState
@@ -24,9 +27,23 @@ import com.example.dj.model.EqBand
 import com.example.dj.model.EqPreset
 import com.example.dj.model.HotCue
 import com.example.dj.model.KeyboardShortcutFeedback
+import com.example.dj.model.LibraryBottomTab
+import com.example.dj.model.LibraryCrate
+import com.example.dj.model.LibrarySortColumn
 import com.example.dj.model.LoopState
+import com.example.dj.model.ProModeTab
+import com.example.dj.model.SamplePadBank
+import com.example.dj.model.SamplePadEffect
+import com.example.dj.model.SamplerSound
+import com.example.dj.model.SeratoHotCueDefaults
+import com.example.dj.model.StemChannelState
+import com.example.dj.model.StemFxType
+import com.example.dj.model.StemIsolationPreset
 import com.example.dj.model.StemType
+import com.example.dj.model.TrimGainMath
+import com.example.dj.model.WaveformZoomConfig
 import java.io.File
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,10 +62,12 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
 
   val stemAudioEngine = StemAudioEngine()
   val localAudioEngine = AudioEngine()
+  val samplePadAudioEngine = SamplePadAudioEngine(application)
   val midiManager = MidiControllerManager(application)
 
   private val tapTrackerA = BpmSyncEngine.TapTempoTracker()
   private val tapTrackerB = BpmSyncEngine.TapTempoTracker()
+  private val masterTapAggregator = BpmSyncEngine.MasterTapTempoAggregator()
 
   private val _uiState = MutableStateFlow(DjUiState())
   val uiState: StateFlow<DjUiState> = _uiState.asStateFlow()
@@ -57,12 +76,13 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
   private var feedbackClearJob: Job? = null
 
   private val cueColors = listOf(0xFF00E5FF, 0xFFFF7A00, 0xFF00E676, 0xFFFF3DF0)
-  private val loopBeatOptions = listOf(0.25f, 0.5f, 1f, 2f, 4f, 8f)
+  private val loopBeatOptions = listOf(0.25f, 0.5f, 1f, 2f, 4f, 8f, 16f)
   private val autoMixDurations = listOf(4, 8, 12, 16)
 
   init {
     viewModelScope.launch(Dispatchers.IO) {
-      repository.seedDefaultsIfNeeded()
+      val bundled = BundledAndLocalTrackScanner.discoverBundledSongTracks(getApplication())
+      repository.seedDefaultsIfNeeded(bundled)
       repository.scanAndPopulateMissingBeatGrids()
     }
 
@@ -114,8 +134,10 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
         val intervalMs = if (state.powerSavingMode) 100L else 33L
         val dtSeconds = intervalMs / 1000f
 
-        var updatedA = advanceDeck(state.deckA, dtSeconds)
-        var updatedB = advanceDeck(state.deckB, dtSeconds)
+        val (enginePeakA, enginePeakB) = stemAudioEngine.deckPeaks.value
+        val (engineInputA, engineInputB) = stemAudioEngine.deckInputLevels.value
+        var updatedA = advanceDeck(state.deckA, dtSeconds, enginePeakA, engineInputA)
+        var updatedB = advanceDeck(state.deckB, dtSeconds, enginePeakB, engineInputB)
         var newCrossfader = state.crossfader
         var isAutoMixing = state.isAutoMixing
 
@@ -181,36 +203,71 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  private fun advanceDeck(deck: DeckState, dtSeconds: Float): DeckState {
-    if (!deck.isPlaying) return deck
+  private fun advanceDeck(
+    deck: DeckState,
+    dtSeconds: Float,
+    enginePeak: Float = 0f,
+    engineInputLevel: Float = 0f,
+  ): DeckState {
+    if (!deck.isPlaying) {
+      if (deck.livePeakIntensity <= 0.01f && deck.inputSignalLevel <= 0.01f) return deck
+      val decayedPeak = (deck.livePeakIntensity * 0.55f).let { if (it < 0.015f) 0f else it }
+      val decayedInput = (deck.inputSignalLevel * 0.55f).let { if (it < 0.015f) 0f else it }
+      return deck.copy(livePeakIntensity = decayedPeak, inputSignalLevel = decayedInput)
+    }
     val duration = deck.track.durationSeconds.coerceAtLeast(1).toFloat()
     val speed = (1f + deck.tempoOffset).coerceAtLeast(0.25f)
     var nextProgress = deck.playheadProgress + (dtSeconds * speed) / duration
     if (deck.loop.isActive && deck.loop.endProgress > deck.loop.startProgress) {
       if (nextProgress >= deck.loop.endProgress) {
         nextProgress = deck.loop.startProgress
-        if (localAudioEngine.isLoaded(deck.deckId)) {
+        if (stemAudioEngine.hasDecodedBuffer(deck.deckId)) {
+          stemAudioEngine.seekDeck(deck.deckId, nextProgress)
+        } else if (localAudioEngine.isLoaded(deck.deckId)) {
           localAudioEngine.seekTo(deck.deckId, nextProgress)
         }
       }
     } else if (nextProgress >= 1f) {
       nextProgress -= 1f
+      if (stemAudioEngine.hasDecodedBuffer(deck.deckId)) {
+        stemAudioEngine.seekDeck(deck.deckId, nextProgress)
+      }
     }
     val nextRot = (deck.jogRotationDeg + dtSeconds * 198f * speed) % 360f
-    return deck.copy(playheadProgress = nextProgress, jogRotationDeg = nextRot)
+    val advancedDeck = deck.copy(playheadProgress = nextProgress)
+    val targetPeak =
+      if (enginePeak > 0.01f) enginePeak.coerceIn(0f, 1f)
+      else BeatSyncedWaveformMath.computeFallbackPeakIntensity(advancedDeck)
+    val peakSmoothing = if (targetPeak > deck.livePeakIntensity) 0.70f else 0.35f
+    val smoothedPeak =
+      (deck.livePeakIntensity * (1f - peakSmoothing) + targetPeak * peakSmoothing).coerceIn(0f, 1f)
+
+    val targetInput =
+      if (engineInputLevel > 0.01f) engineInputLevel.coerceIn(0f, 1f)
+      else TrimGainMath.computeFallbackInputLevel(advancedDeck)
+    val inputSmoothing = if (targetInput > deck.inputSignalLevel) 0.72f else 0.38f
+    val smoothedInput =
+      (deck.inputSignalLevel * (1f - inputSmoothing) + targetInput * inputSmoothing).coerceIn(0f, 1f)
+
+    return deck.copy(
+      playheadProgress = nextProgress,
+      jogRotationDeg = nextRot,
+      livePeakIntensity = smoothedPeak,
+      inputSignalLevel = smoothedInput,
+    )
   }
 
   private fun syncAudioEngines() {
     val state = _uiState.value
-    val hasLocalA = localAudioEngine.isLoaded(DeckId.A)
-    val hasLocalB = localAudioEngine.isLoaded(DeckId.B)
+    val hasLocalA = localAudioEngine.isLoaded(DeckId.A) && !stemAudioEngine.hasDecodedBuffer(DeckId.A)
+    val hasLocalB = localAudioEngine.isLoaded(DeckId.B) && !stemAudioEngine.hasDecodedBuffer(DeckId.B)
     stemAudioEngine.updateMixState(
       deckA = state.deckA,
       deckB = state.deckB,
       crossfader = state.crossfader,
       curve = state.crossfaderCurve,
-      deckAHasLocalAudio = hasLocalA,
-      deckBHasLocalAudio = hasLocalB,
+      deckAHasLocalFallbackOnly = hasLocalA,
+      deckBHasLocalFallbackOnly = hasLocalB,
     )
     val (gainA, gainB) = state.crossfaderCurve.computeGains(state.crossfader)
     if (hasLocalA) {
@@ -218,12 +275,14 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
         DeckId.A,
         (gainA * state.deckA.trimGain * state.deckA.channelVolume).coerceIn(0f, 1f),
       )
+      localAudioEngine.setPitch(DeckId.A, state.deckA.keyPitchMultiplier)
     }
     if (hasLocalB) {
       localAudioEngine.setVolume(
         DeckId.B,
         (gainB * state.deckB.trimGain * state.deckB.channelVolume).coerceIn(0f, 1f),
       )
+      localAudioEngine.setPitch(DeckId.B, state.deckB.keyPitchMultiplier)
     }
   }
 
@@ -241,7 +300,7 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     val current = if (deckId == DeckId.A) _uiState.value.deckA else _uiState.value.deckB
     val nextPlaying = !current.isPlaying
     updateDeck(deckId) { it.copy(isPlaying = nextPlaying) }
-    if (localAudioEngine.isLoaded(deckId)) {
+    if (localAudioEngine.isLoaded(deckId) && !stemAudioEngine.hasDecodedBuffer(deckId)) {
       if (nextPlaying) localAudioEngine.play(deckId) else localAudioEngine.pause(deckId)
     }
     if (nextPlaying) {
@@ -254,8 +313,16 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
   fun cueDeck(deckId: DeckId) {
     val current = if (deckId == DeckId.A) _uiState.value.deckA else _uiState.value.deckB
     val target = current.hotCues[1]?.progress ?: 0f
-    updateDeck(deckId) { it.copy(isPlaying = false, playheadProgress = target) }
-    if (localAudioEngine.isLoaded(deckId)) {
+    updateDeck(deckId) {
+      it.copy(
+        isPlaying = false,
+        playheadProgress = target,
+        livePeakIntensity = 0f,
+        inputSignalLevel = 0f,
+      )
+    }
+    stemAudioEngine.seekDeck(deckId, target)
+    if (localAudioEngine.isLoaded(deckId) && !stemAudioEngine.hasDecodedBuffer(deckId)) {
       localAudioEngine.pause(deckId)
       localAudioEngine.seekTo(deckId, target)
     }
@@ -265,22 +332,63 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     val state = _uiState.value
     val source = if (deckId == DeckId.A) state.deckA else state.deckB
     val target = if (deckId == DeckId.A) state.deckB else state.deckA
+    if (source.isAutoSynced && abs(source.effectiveBpm - target.effectiveBpm) < 0.08f) {
+      updateDeck(deckId) { it.copy(isAutoSynced = false) }
+      showShortcutFeedback("${deckId.label} AUTO-SYNC OFF")
+      return
+    }
     val offset =
       BpmSyncEngine.calculateSyncOffset(
         sourceBaseBpm = source.track.bpm,
         targetEffectiveBpm = target.effectiveBpm,
         maxRange = source.pitchRange.maxOffset,
       )
+    val syncedBpm = source.track.bpm * (1f + offset)
+    val alignedProgress =
+      BpmSyncEngine.calculatePhaseAlignedProgress(
+        sourcePlayheadProgress = source.playheadProgress,
+        sourceSyncedBpm = syncedBpm,
+        sourceDurationSeconds = source.track.durationSeconds,
+        targetPlayheadProgress = target.playheadProgress,
+        targetEffectiveBpm = target.effectiveBpm,
+        targetDurationSeconds = target.track.durationSeconds,
+      )
     updateDeck(deckId) {
-      it.copy(tempoOffset = offset, playheadProgress = target.playheadProgress)
+      it.copy(
+        tempoOffset = offset,
+        playheadProgress = alignedProgress,
+        isAutoSynced = true,
+      )
     }
-    if (localAudioEngine.isLoaded(deckId)) {
-      localAudioEngine.seekTo(deckId, target.playheadProgress)
+    stemAudioEngine.seekDeck(deckId, alignedProgress)
+    if (localAudioEngine.isLoaded(deckId) && !stemAudioEngine.hasDecodedBuffer(deckId)) {
+      localAudioEngine.seekTo(deckId, alignedProgress)
+    }
+    showShortcutFeedback("${deckId.label} AUTO-SYNCED ${String.format("%.1f", target.effectiveBpm)} BPM")
+  }
+
+  fun keySyncDeck(deckId: DeckId) {
+    val state = _uiState.value
+    val source = if (deckId == DeckId.A) state.deckA else state.deckB
+    val target = if (deckId == DeckId.A) state.deckB else state.deckA
+    val targetEffectiveKey = target.effectiveMusicalKey
+    updateDeck(deckId) { deck ->
+      if (deck.isKeySynced) {
+        deck.copy(isKeySynced = false, keyShiftSemitones = 0)
+      } else {
+        val semitones =
+          CamelotKeyMath.calculateKeySyncSemitones(
+            sourceMusicalKey = deck.track.musicalKey,
+            targetMusicalKey = targetEffectiveKey,
+          )
+        deck.copy(isKeySynced = true, keyShiftSemitones = semitones)
+      }
     }
   }
 
   fun loadTrack(deckId: DeckId, track: DjTrack) {
     localAudioEngine.unloadDeck(deckId)
+    stemAudioEngine.setDecodedBuffer(deckId, null)
     val autoTrim = track.computeAutoGainTrim()
     updateDeck(deckId) {
       it.copy(
@@ -291,65 +399,79 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
         trimGain = autoTrim,
         hotCues = emptyMap(),
         loop = LoopState(),
+        preQuickIsolateVocalLevel = null,
+        preQuickIsolateFilter = null,
+        keyShiftSemitones = 0,
+        isKeySynced = false,
+        isAutoSynced = false,
+        livePeakIntensity = 0f,
       )
     }
     if (!track.localUri.isNullOrBlank()) {
-      runCatching {
-        val uri = Uri.parse(track.localUri)
-        localAudioEngine.loadFile(deckId, getApplication(), uri)
+      val uri = Uri.parse(track.localUri)
+      runCatching { localAudioEngine.loadFile(deckId, getApplication(), uri) }
+      decodeLocalTrackForStems(deckId, uri, track)
+    }
+  }
+
+  private fun decodeLocalTrackForStems(deckId: DeckId, uri: Uri, existingTrack: DjTrack) {
+    viewModelScope.launch(Dispatchers.IO) {
+      val pcm = AudioDecoder.decodeUriToStereoPcm(getApplication(), uri) ?: return@launch
+      val updatedTrack =
+        existingTrack.copy(
+          bpm = pcm.detectedBpm,
+          durationSeconds = pcm.durationSeconds,
+          waveformPeaks = pcm.waveformPeaks,
+          beatGrid = DjTrack.computeBeatGrid(pcm.detectedBpm, pcm.durationSeconds),
+        )
+      repository.upsertTrack(updatedTrack)
+
+      val currentDeckTrackId =
+        if (deckId == DeckId.A) _uiState.value.deckA.track.id else _uiState.value.deckB.track.id
+      if (currentDeckTrackId == existingTrack.id) {
+        val currentProgress =
+          if (deckId == DeckId.A) _uiState.value.deckA.playheadProgress
+          else _uiState.value.deckB.playheadProgress
+        stemAudioEngine.setDecodedBuffer(deckId, pcm)
+        stemAudioEngine.seekDeck(deckId, currentProgress)
+        localAudioEngine.unloadDeck(deckId)
+        updateDeck(deckId) {
+          it.copy(track = updatedTrack, trimGain = updatedTrack.computeAutoGainTrim())
+        }
       }
     }
   }
 
   fun loadLocalAudioUri(deckId: DeckId, uri: Uri) {
-    val context = getApplication<Application>()
-    var title = "Local Track"
-    var artist = "Local File"
-    var durationSec = 180
-
-    runCatching {
-      context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        if (cursor.moveToFirst() && nameIdx >= 0) {
-          title = cursor.getString(nameIdx).substringBeforeLast('.')
-        }
-      }
-    }
-
-    runCatching {
-      val retriever = MediaMetadataRetriever()
-      retriever.setDataSource(context, uri)
-      retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.takeIf { it.isNotBlank() }?.let {
-        title = it
-      }
-      retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)?.takeIf { it.isNotBlank() }?.let {
-        artist = it
-      }
-      retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.let { ms ->
-        durationSec = (ms / 1000L).toInt().coerceAtLeast(10)
-      }
-      retriever.release()
-    }
-
-    val trackId = "local_${uri.toString().hashCode()}"
-    val bpm = 124f
-    val track =
-      DjTrack(
-        id = trackId,
-        title = title,
-        artist = artist,
-        bpm = bpm,
-        musicalKey = "Am",
-        genre = "Local Audio",
-        durationSeconds = durationSec,
-        baseFreqHz = 220f,
-        localUri = uri.toString(),
-        waveformPeaks = DjTrack.generateWaveform(trackId, 64),
-        beatGrid = DjTrack.computeBeatGrid(bpm, durationSec),
-      )
-
+    val track = BundledAndLocalTrackScanner.extractTrackFromUri(getApplication(), uri)
     viewModelScope.launch(Dispatchers.IO) { repository.upsertTrack(track) }
     loadTrack(deckId, track)
+  }
+
+  fun importLocalAudioUris(uris: List<Uri>) {
+    if (uris.isEmpty()) return
+    viewModelScope.launch(Dispatchers.IO) {
+      _uiState.update { it.copy(isRefreshingLibrary = true) }
+      val imported = uris.map { BundledAndLocalTrackScanner.extractTrackFromUri(getApplication(), it) }
+      repository.upsertTracks(imported)
+      _uiState.update { it.copy(isRefreshingLibrary = false) }
+      showShortcutFeedback("IMPORTED ${imported.size} SONGS")
+    }
+  }
+
+  fun importAudioFolderTree(treeUri: Uri) {
+    viewModelScope.launch(Dispatchers.IO) {
+      _uiState.update { it.copy(isRefreshingLibrary = true) }
+      val uris = BundledAndLocalTrackScanner.scanDocumentTreeAudioUris(getApplication(), treeUri)
+      if (uris.isNotEmpty()) {
+        val imported = uris.map { BundledAndLocalTrackScanner.extractTrackFromUri(getApplication(), it) }
+        repository.upsertTracks(imported)
+        showShortcutFeedback("LOADED ${imported.size} FOLDER SONGS")
+      } else {
+        showShortcutFeedback("NO AUDIO FILES IN FOLDER")
+      }
+      _uiState.update { it.copy(isRefreshingLibrary = false) }
+    }
   }
 
   fun updateTrackMetadata(trackId: String, title: String, artist: String, genre: String) {
@@ -372,17 +494,190 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
+  fun toggleQuickIsolateMode(deckId: DeckId) {
+    updateDeck(deckId) { deck ->
+      val nextEnabled = !deck.quickIsolateEnabled
+      if (!nextEnabled && deck.isQuickIsolateActive) {
+        val vox = deck.stems[StemType.VOCALS]
+        val restoredLevel = deck.preQuickIsolateVocalLevel ?: 1f
+        val restoredFilter =
+          if (abs(deck.effects.filter - DeckState.QUICK_ISOLATE_HPF) < 0.03f) {
+            deck.preQuickIsolateFilter ?: 0f
+          } else {
+            deck.effects.filter
+          }
+        deck.copy(
+          quickIsolateEnabled = false,
+          stems =
+            if (vox != null) {
+              deck.stems + (StemType.VOCALS to vox.copy(level = restoredLevel, isMuted = false, isSolo = false))
+            } else {
+              deck.stems
+            },
+          effects = deck.effects.copy(filter = restoredFilter),
+          preQuickIsolateVocalLevel = null,
+          preQuickIsolateFilter = null,
+        )
+      } else {
+        deck.copy(quickIsolateEnabled = nextEnabled)
+      }
+    }
+  }
+
   fun toggleStemMute(deckId: DeckId, stem: StemType) {
     updateDeck(deckId) { deck ->
       val current = deck.stems[stem] ?: return@updateDeck deck
-      deck.copy(stems = deck.stems + (stem to current.copy(isMuted = !current.isMuted)))
+      if (stem == StemType.VOCALS && deck.quickIsolateEnabled) {
+        val nextMuted = !current.isMuted
+        if (nextMuted) {
+          val savedVocalLevel =
+            if (current.level > 0.01f) current.level else (deck.preQuickIsolateVocalLevel ?: 1f)
+          val savedFilter = deck.preQuickIsolateFilter ?: deck.effects.filter
+          val nextFilter =
+            if (deck.effects.filter > DeckState.QUICK_ISOLATE_HPF) {
+              deck.effects.filter
+            } else {
+              DeckState.QUICK_ISOLATE_HPF
+            }
+          deck.copy(
+            stems =
+              deck.stems +
+                (StemType.VOCALS to current.copy(level = 0f, isMuted = true, isSolo = false)),
+            effects = deck.effects.copy(filter = nextFilter),
+            preQuickIsolateVocalLevel = savedVocalLevel,
+            preQuickIsolateFilter = savedFilter,
+          )
+        } else {
+          val restoredLevel =
+            deck.preQuickIsolateVocalLevel ?: if (current.level <= 0.01f) 1f else current.level
+          val restoredFilter =
+            if (abs(deck.effects.filter - DeckState.QUICK_ISOLATE_HPF) < 0.03f) {
+              deck.preQuickIsolateFilter ?: 0f
+            } else {
+              deck.effects.filter
+            }
+          deck.copy(
+            stems =
+              deck.stems +
+                (StemType.VOCALS to
+                  current.copy(level = restoredLevel, isMuted = false, isSolo = false)),
+            effects = deck.effects.copy(filter = restoredFilter),
+            preQuickIsolateVocalLevel = null,
+            preQuickIsolateFilter = null,
+          )
+        }
+      } else {
+        val nextMuted = !current.isMuted
+        if (stem == StemType.VOCALS && !nextMuted && (current.level <= 0.01f || deck.preQuickIsolateFilter != null)) {
+          val restoredLevel =
+            if (current.level <= 0.01f) (deck.preQuickIsolateVocalLevel ?: 1f) else current.level
+          val restoredFilter =
+            if (abs(deck.effects.filter - DeckState.QUICK_ISOLATE_HPF) < 0.03f) {
+              deck.preQuickIsolateFilter ?: deck.effects.filter
+            } else {
+              deck.effects.filter
+            }
+          deck.copy(
+            stems =
+              deck.stems +
+                (stem to current.copy(level = restoredLevel, isMuted = false, isSolo = false)),
+            effects = deck.effects.copy(filter = restoredFilter),
+            preQuickIsolateVocalLevel = null,
+            preQuickIsolateFilter = null,
+          )
+        } else {
+          deck.copy(
+            stems = deck.stems + (stem to current.copy(isMuted = nextMuted, isSolo = false))
+          )
+        }
+      }
     }
   }
 
   fun toggleStemSolo(deckId: DeckId, stem: StemType) {
     updateDeck(deckId) { deck ->
       val current = deck.stems[stem] ?: return@updateDeck deck
-      deck.copy(stems = deck.stems + (stem to current.copy(isSolo = !current.isSolo)))
+      val restoredLevel =
+        if (stem == StemType.VOCALS && current.level <= 0.01f) {
+          deck.preQuickIsolateVocalLevel ?: 1f
+        } else {
+          current.level
+        }
+      val restoredFilter =
+        if (stem == StemType.VOCALS && deck.preQuickIsolateFilter != null && abs(deck.effects.filter - DeckState.QUICK_ISOLATE_HPF) < 0.03f) {
+          deck.preQuickIsolateFilter
+        } else {
+          deck.effects.filter
+        }
+      deck.copy(
+        stems =
+          deck.stems +
+            (stem to current.copy(level = restoredLevel, isSolo = !current.isSolo, isMuted = false)),
+        effects = deck.effects.copy(filter = restoredFilter),
+        preQuickIsolateVocalLevel = if (stem == StemType.VOCALS) null else deck.preQuickIsolateVocalLevel,
+        preQuickIsolateFilter = if (stem == StemType.VOCALS) null else deck.preQuickIsolateFilter,
+      )
+    }
+  }
+
+  fun applyStemPreset(deckId: DeckId, preset: StemIsolationPreset) {
+    updateDeck(deckId) { deck ->
+      val effectivePreset =
+        when {
+          preset == StemIsolationPreset.INSTRUMENTAL && deck.isVoiceRemoved ->
+            StemIsolationPreset.FULL
+          preset == StemIsolationPreset.ACAPELLA && deck.isInstrumentalRemoved ->
+            StemIsolationPreset.FULL
+          else -> preset
+        }
+      val nextStems =
+        when (effectivePreset) {
+          StemIsolationPreset.FULL ->
+            StemType.entries.associateWith { StemChannelState(level = 1f, isMuted = false, isSolo = false) }
+          StemIsolationPreset.INSTRUMENTAL ->
+            mapOf(
+              StemType.VOCALS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.DRUMS to StemChannelState(level = 1f, isMuted = false, isSolo = false),
+              StemType.BASS to StemChannelState(level = 1f, isMuted = false, isSolo = false),
+              StemType.MELODY to StemChannelState(level = 1f, isMuted = false, isSolo = false),
+            )
+          StemIsolationPreset.ACAPELLA ->
+            mapOf(
+              StemType.VOCALS to StemChannelState(level = 1f, isMuted = false, isSolo = true),
+              StemType.DRUMS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.BASS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.MELODY to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+            )
+          StemIsolationPreset.DRUMS_ONLY ->
+            mapOf(
+              StemType.VOCALS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.DRUMS to StemChannelState(level = 1f, isMuted = false, isSolo = true),
+              StemType.BASS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.MELODY to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+            )
+          StemIsolationPreset.BASS_ONLY ->
+            mapOf(
+              StemType.VOCALS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.DRUMS to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+              StemType.BASS to StemChannelState(level = 1f, isMuted = false, isSolo = true),
+              StemType.MELODY to StemChannelState(level = 1f, isMuted = true, isSolo = false),
+            )
+        }
+      val restoredFilter =
+        if (effectivePreset == StemIsolationPreset.FULL &&
+          deck.preQuickIsolateFilter != null &&
+          abs(deck.effects.filter - DeckState.QUICK_ISOLATE_HPF) < 0.03f
+        ) {
+          deck.preQuickIsolateFilter
+        } else {
+          deck.effects.filter
+        }
+      deck.copy(
+        stems = nextStems,
+        effects = deck.effects.copy(filter = restoredFilter),
+        preQuickIsolateVocalLevel = if (effectivePreset == StemIsolationPreset.FULL) null else deck.preQuickIsolateVocalLevel,
+        preQuickIsolateFilter = if (effectivePreset == StemIsolationPreset.FULL) null else deck.preQuickIsolateFilter,
+      )
     }
   }
 
@@ -427,8 +722,34 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
+  fun toggleStemFx(deckId: DeckId, fxType: StemFxType) {
+    updateDeck(deckId) { deck ->
+      val fx = deck.effects
+      val nextFx =
+        when (fxType) {
+          StemFxType.VOCAL_ECHO -> fx.copy(vocalEcho = !fx.vocalEcho)
+          StemFxType.INST_ECHO -> fx.copy(instEcho = !fx.instEcho)
+          StemFxType.INST_BRAKER -> fx.copy(instBrake = !fx.instBrake)
+          StemFxType.DRUMS_ECHO -> fx.copy(drumsEcho = !fx.drumsEcho)
+        }
+      deck.copy(effects = nextFx)
+    }
+  }
+
   fun setTrimGain(deckId: DeckId, trim: Float) {
-    updateDeck(deckId) { it.copy(trimGain = trim.coerceIn(0.2f, 1.8f)) }
+    val clamped = TrimGainMath.clamp(trim)
+    updateDeck(deckId) { deck ->
+      val next = deck.copy(trimGain = clamped)
+      if (next.isPlaying) {
+        next.copy(inputSignalLevel = TrimGainMath.computeFallbackInputLevel(next))
+      } else {
+        next
+      }
+    }
+  }
+
+  fun resetTrimGain(deckId: DeckId) {
+    setTrimGain(deckId, TrimGainMath.UNITY_TRIM)
   }
 
   fun setChannelVolume(deckId: DeckId, volume: Float) {
@@ -438,7 +759,7 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
   fun setTempoOffset(deckId: DeckId, offset: Float) {
     updateDeck(deckId) { deck ->
       val max = deck.pitchRange.maxOffset
-      deck.copy(tempoOffset = offset.coerceIn(-max, max))
+      deck.copy(tempoOffset = offset.coerceIn(-max, max), isAutoSynced = false)
     }
   }
 
@@ -452,23 +773,71 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     }
   }
 
-  fun tapTempo(deckId: DeckId) {
+  fun tapTempo(deckId: DeckId, nowMs: Long = System.currentTimeMillis()) {
     val tracker = if (deckId == DeckId.A) tapTrackerA else tapTrackerB
-    val detected = tracker.recordTap() ?: return
-    updateDeck(deckId) { deck ->
-      val updatedTrack =
-        deck.track.copy(
-          bpm = detected,
-          beatGrid = DjTrack.computeBeatGrid(detected, deck.track.durationSeconds),
-        )
-      deck.copy(track = updatedTrack, tempoOffset = 0f)
+    val detected = tracker.recordTap(nowMs)
+    val tapSource =
+      if (deckId == DeckId.A) BpmSyncEngine.TapSource.DECK_A
+      else BpmSyncEngine.TapSource.DECK_B
+    val masterDetected = masterTapAggregator.recordTap(tapSource, nowMs)
+
+    _uiState.update { state ->
+      val nextState =
+        if (detected != null) {
+          val updateTarget: (DeckState) -> DeckState = { deck ->
+            val updatedTrack =
+              deck.track.copy(
+                bpm = detected,
+                beatGrid = DjTrack.computeBeatGrid(detected, deck.track.durationSeconds),
+              )
+            deck.copy(track = updatedTrack, tempoOffset = 0f)
+          }
+          if (deckId == DeckId.A) state.copy(deckA = updateTarget(state.deckA))
+          else state.copy(deckB = updateTarget(state.deckB))
+        } else {
+          state
+        }
+      nextState.copy(
+        masterTappedBpm = masterDetected ?: nextState.masterTappedBpm,
+        masterTapSource = masterTapAggregator.sourceSummary(),
+        masterTapCount = masterTapAggregator.tapCount(),
+        lastMasterTapAtMs = nowMs,
+      )
+    }
+    if (detected != null) {
+      syncAudioEngines()
+    }
+  }
+
+  fun tapMasterTempo(nowMs: Long = System.currentTimeMillis()) {
+    val masterDetected = masterTapAggregator.recordTap(BpmSyncEngine.TapSource.MASTER, nowMs)
+    _uiState.update { state ->
+      state.copy(
+        masterTappedBpm = masterDetected ?: state.masterTappedBpm,
+        masterTapSource = masterTapAggregator.sourceSummary(),
+        masterTapCount = masterTapAggregator.tapCount(),
+        lastMasterTapAtMs = nowMs,
+      )
+    }
+  }
+
+  fun resetMasterTapTempo() {
+    masterTapAggregator.reset()
+    _uiState.update { state ->
+      state.copy(
+        masterTappedBpm = null,
+        masterTapSource = null,
+        masterTapCount = 0,
+        lastMasterTapAtMs = 0L,
+      )
     }
   }
 
   fun scrubDeck(deckId: DeckId, deltaProgress: Float) {
     updateDeck(deckId) { deck ->
       val next = (deck.playheadProgress + deltaProgress).coerceIn(0f, 1f)
-      if (localAudioEngine.isLoaded(deckId)) {
+      stemAudioEngine.seekDeck(deckId, next)
+      if (localAudioEngine.isLoaded(deckId) && !stemAudioEngine.hasDecodedBuffer(deckId)) {
         localAudioEngine.seekTo(deckId, next)
       }
       deck.copy(
@@ -480,7 +849,7 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
 
   fun rotateJogWheel(deckId: DeckId, deltaAngleDeg: Float) {
     val deck = if (deckId == DeckId.A) _uiState.value.deckA else _uiState.value.deckB
-    if (!deck.isPlaying) {
+    if (!deck.isPlaying || deck.scratchMode) {
       scrubDeck(deckId, deltaAngleDeg / 720f)
     } else {
       val nudge = (deltaAngleDeg / 1800f).coerceIn(-0.04f, 0.04f)
@@ -493,13 +862,21 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     updateDeck(deckId) { deck ->
       val existing = deck.hotCues[slot]
       if (existing != null) {
-        if (localAudioEngine.isLoaded(deckId)) {
+        stemAudioEngine.seekDeck(deckId, existing.progress)
+        if (localAudioEngine.isLoaded(deckId) && !stemAudioEngine.hasDecodedBuffer(deckId)) {
           localAudioEngine.seekTo(deckId, existing.progress)
         }
         deck.copy(playheadProgress = existing.progress)
       } else {
         val snapped = deck.snapToBeatGrid(deck.playheadProgress)
-        val cue = HotCue(slot = slot, progress = snapped, colorHex = cueColors[(slot - 1) % cueColors.size])
+        val meta = SeratoHotCueDefaults.metaForSlot(slot)
+        val cue =
+          HotCue(
+            slot = slot,
+            progress = snapped,
+            colorHex = meta.colorHex,
+            label = meta.label,
+          )
         deck.copy(hotCues = deck.hotCues + (slot to cue))
       }
     }
@@ -547,6 +924,62 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
         (nextBeats * beatDurationSec) / deck.track.durationSeconds.coerceAtLeast(1)
       val end = (deck.loop.startProgress + loopSpanProgress).coerceAtMost(1f)
       deck.copy(loop = deck.loop.copy(beats = nextBeats, endProgress = end))
+    }
+  }
+
+  fun triggerAutoLoop(deckId: DeckId, beats: Float) {
+    val normalizedBeats = beats.coerceIn(0.25f, 16f)
+    updateDeck(deckId) { deck ->
+      if (deck.loop.isActive && abs(deck.loop.beats - normalizedBeats) < 0.01f) {
+        deck.copy(loop = deck.loop.copy(isActive = false))
+      } else {
+        val start = deck.snapToBeatGrid(deck.playheadProgress)
+        val beatDurationSec = 60f / deck.effectiveBpm.coerceAtLeast(1f)
+        val loopSpanProgress =
+          (normalizedBeats * beatDurationSec) / deck.track.durationSeconds.coerceAtLeast(1)
+        val end = (start + loopSpanProgress).coerceAtMost(1f)
+        deck.copy(
+          loop =
+            deck.loop.copy(
+              isActive = true,
+              beats = normalizedBeats,
+              startProgress = start,
+              endProgress = end,
+            )
+        )
+      }
+    }
+  }
+
+  fun halveLoop(deckId: DeckId) {
+    updateDeck(deckId) { deck ->
+      val nextBeats = (deck.loop.beats * 0.5f).coerceAtLeast(loopBeatOptions.first())
+      val start =
+        if (deck.loop.isActive) deck.loop.startProgress
+        else deck.snapToBeatGrid(deck.playheadProgress)
+      val beatDurationSec = 60f / deck.effectiveBpm.coerceAtLeast(1f)
+      val loopSpanProgress =
+        (nextBeats * beatDurationSec) / deck.track.durationSeconds.coerceAtLeast(1)
+      val end = (start + loopSpanProgress).coerceAtMost(1f)
+      deck.copy(
+        loop = deck.loop.copy(beats = nextBeats, startProgress = start, endProgress = end)
+      )
+    }
+  }
+
+  fun doubleLoop(deckId: DeckId) {
+    updateDeck(deckId) { deck ->
+      val nextBeats = (deck.loop.beats * 2f).coerceAtMost(loopBeatOptions.last())
+      val start =
+        if (deck.loop.isActive) deck.loop.startProgress
+        else deck.snapToBeatGrid(deck.playheadProgress)
+      val beatDurationSec = 60f / deck.effectiveBpm.coerceAtLeast(1f)
+      val loopSpanProgress =
+        (nextBeats * beatDurationSec) / deck.track.durationSeconds.coerceAtLeast(1)
+      val end = (start + loopSpanProgress).coerceAtMost(1f)
+      deck.copy(
+        loop = deck.loop.copy(beats = nextBeats, startProgress = start, endProgress = end)
+      )
     }
   }
 
@@ -605,6 +1038,133 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
     _uiState.update { it.copy(showShortcutsDialog = show ?: !it.showShortcutsDialog) }
   }
 
+  fun setWaveformZoom(zoom: Float) {
+    _uiState.update { it.copy(waveformZoom = zoom.coerceIn(1.0f, 8.0f)) }
+  }
+
+  fun zoomInWaveform() {
+    _uiState.update { state ->
+      val next = WaveformZoomConfig.steps.firstOrNull { it > state.waveformZoom + 0.05f }
+        ?: WaveformZoomConfig.steps.last()
+      state.copy(waveformZoom = next)
+    }
+  }
+
+  fun zoomOutWaveform() {
+    _uiState.update { state ->
+      val prev = WaveformZoomConfig.steps.lastOrNull { it < state.waveformZoom - 0.05f }
+        ?: WaveformZoomConfig.steps.first()
+      state.copy(waveformZoom = prev)
+    }
+  }
+
+  fun toggleWaveformNeutral() {
+    _uiState.update { it.copy(isWaveformNeutral = !it.isWaveformNeutral) }
+  }
+
+  fun setProModeTab(tab: ProModeTab) {
+    _uiState.update { it.copy(activeProTab = tab) }
+  }
+
+  fun selectCrate(crate: LibraryCrate) {
+    _uiState.update { it.copy(selectedCrate = crate) }
+  }
+
+  fun setBottomLibraryTab(tab: LibraryBottomTab) {
+    _uiState.update { it.copy(bottomLibraryTab = tab) }
+  }
+
+  fun setLibrarySearchQuery(query: String) {
+    _uiState.update { it.copy(librarySearchQuery = query) }
+  }
+
+  fun setLibrarySortColumn(column: LibrarySortColumn) {
+    _uiState.update { state ->
+      val asc = if (state.librarySortColumn == column) !state.librarySortAscending else true
+      state.copy(librarySortColumn = column, librarySortAscending = asc)
+    }
+  }
+
+  fun togglePrepareTrack(trackId: String) {
+    _uiState.update { state ->
+      val next =
+        if (trackId in state.prepareTrackIds) state.prepareTrackIds - trackId
+        else state.prepareTrackIds + trackId
+      state.copy(prepareTrackIds = next)
+    }
+  }
+
+  fun refreshLibrary() {
+    viewModelScope.launch(Dispatchers.IO) {
+      _uiState.update { it.copy(isRefreshingLibrary = true) }
+      val bundled = BundledAndLocalTrackScanner.discoverBundledSongTracks(getApplication())
+      repository.seedDefaultsIfNeeded(bundled)
+      repository.scanAndPopulateMissingBeatGrids()
+      delay(300L)
+      _uiState.update { it.copy(isRefreshingLibrary = false) }
+    }
+  }
+
+  fun triggerSampler(sound: SamplerSound) {
+    stemAudioEngine.triggerSampler(sound)
+    _uiState.update { it.copy(lastSamplerTriggered = sound) }
+    showShortcutFeedback("SAMPLER: ${sound.title.uppercase()}")
+  }
+
+  fun toggleSamplePad(pad: SamplePadEffect) {
+    val state = _uiState.value
+    if (pad.id in state.activeSamplePadIds) {
+      samplePadAudioEngine.stopPad(pad.id)
+      _uiState.update { it.copy(activeSamplePadIds = it.activeSamplePadIds - pad.id) }
+      showShortcutFeedback("PAD OFF: ${pad.title.uppercase()}")
+    } else {
+      _uiState.update {
+        it.copy(
+          activeSamplePadIds = it.activeSamplePadIds + pad.id,
+          lastSamplePadTriggeredId = pad.id,
+        )
+      }
+      val startedReal =
+        samplePadAudioEngine.playPad(
+          pad = pad,
+          volume = state.samplePadVolume,
+          loop = state.samplePadLoopEnabled,
+          onCompleted = { finishedId -> onSamplePadCompleted(finishedId) },
+        )
+      if (!startedReal) {
+        stemAudioEngine.triggerSampler(pad.fallbackSynth)
+      }
+      showShortcutFeedback("PAD ON: ${pad.title.uppercase()}")
+    }
+  }
+
+  fun onSamplePadCompleted(padId: String) {
+    _uiState.update { it.copy(activeSamplePadIds = it.activeSamplePadIds - padId) }
+  }
+
+  fun stopAllSamplePads() {
+    samplePadAudioEngine.stopAll()
+    _uiState.update { it.copy(activeSamplePadIds = emptySet()) }
+    showShortcutFeedback("ALL SAMPLE PADS OFF")
+  }
+
+  fun selectSampleBank(bank: SamplePadBank) {
+    _uiState.update { it.copy(selectedSampleBank = bank) }
+  }
+
+  fun toggleSamplePadLoop() {
+    val next = !_uiState.value.samplePadLoopEnabled
+    _uiState.update { it.copy(samplePadLoopEnabled = next) }
+    samplePadAudioEngine.setLoopAll(next)
+    showShortcutFeedback(if (next) "SAMPLE LOOP ON" else "SAMPLE 1-SHOT MODE")
+  }
+
+  fun setSamplePadVolume(volume: Float) {
+    val clamped = volume.coerceIn(0f, 1f)
+    _uiState.update { it.copy(samplePadVolume = clamped) }
+    samplePadAudioEngine.setVolume(clamped)
+  }
+
   fun handleKeyboardShortcut(command: DjShortcutCommand) {
     when (command) {
       is DjShortcutCommand.NudgeCrossfader -> nudgeCrossfader(command.delta)
@@ -622,6 +1182,10 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
           if (command.deckId == DeckId.A) _uiState.value.deckA.isPlaying
           else _uiState.value.deckB.isPlaying
         showShortcutFeedback("${command.deckId.label}: ${if (playing) "PLAY" else "PAUSE"}")
+      }
+      is DjShortcutCommand.CueDeck -> {
+        cueDeck(command.deckId)
+        showShortcutFeedback("${command.deckId.label} CUE")
       }
       is DjShortcutCommand.SyncDeck -> {
         syncDeck(command.deckId)
@@ -679,6 +1243,7 @@ class DjViewModel(application: Application) : AndroidViewModel(application) {
 
   override fun onCleared() {
     super.onCleared()
+    samplePadAudioEngine.release()
     stemAudioEngine.release()
     localAudioEngine.releaseAll()
     midiManager.release()

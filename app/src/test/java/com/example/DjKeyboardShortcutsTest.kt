@@ -1,14 +1,18 @@
 package com.example
 
+import android.app.Application
 import android.view.KeyEvent as AndroidKeyEvent
 import androidx.compose.ui.input.key.KeyEvent
+import androidx.test.core.app.ApplicationProvider
 import com.example.dj.audio.BpmSyncEngine
 import com.example.dj.input.DjKeyboardShortcuts
 import com.example.dj.input.DjShortcutCommand
 import com.example.dj.model.CrossfaderCurve
 import com.example.dj.model.DeckId
 import com.example.dj.model.StemType
+import com.example.dj.ui.DjViewModel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -48,7 +52,7 @@ class DjKeyboardShortcutsTest {
     val cutB = DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_RIGHT_BRACKET))
     assertTrue(cutB is DjShortcutCommand.SetCrossfader && cutB.value == 1f)
 
-    val center = DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_C))
+    val center = DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_BACKSLASH))
     assertTrue(center is DjShortcutCommand.SetCrossfader && center.value == 0.5f)
 
     val curve = DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_X))
@@ -56,7 +60,7 @@ class DjKeyboardShortcutsTest {
   }
 
   @Test
-  fun `deck transport and stem mute shortcuts map properly`() {
+  fun `deck play cue sync and stem mute shortcuts map properly`() {
     assertEquals(
       DjShortcutCommand.TogglePlay(DeckId.A),
       DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_SPACE)),
@@ -68,11 +72,90 @@ class DjKeyboardShortcutsTest {
       ),
     )
     assertEquals(
+      DjShortcutCommand.CueDeck(DeckId.A),
+      DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_C)),
+    )
+    assertEquals(
+      DjShortcutCommand.CueDeck(DeckId.B),
+      DjKeyboardShortcuts.mapKeyEvent(
+        keyDown(AndroidKeyEvent.KEYCODE_C, AndroidKeyEvent.META_SHIFT_ON)
+      ),
+    )
+    assertEquals(
+      DjShortcutCommand.SyncDeck(DeckId.A),
+      DjKeyboardShortcuts.mapKeyEvent(keyDown(AndroidKeyEvent.KEYCODE_S)),
+    )
+    assertEquals(
+      DjShortcutCommand.SyncDeck(DeckId.B),
+      DjKeyboardShortcuts.mapKeyEvent(
+        keyDown(AndroidKeyEvent.KEYCODE_S, AndroidKeyEvent.META_SHIFT_ON)
+      ),
+    )
+    assertEquals(
       DjShortcutCommand.ToggleStemMute(DeckId.A, StemType.BASS),
       DjKeyboardShortcuts.mapKeyEvent(
         keyDown(AndroidKeyEvent.KEYCODE_3, AndroidKeyEvent.META_SHIFT_ON)
       ),
     )
+  }
+
+  @Test
+  fun `keyboard shortcuts trigger same DjViewModel methods as UI buttons`() {
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val vm = DjViewModel(app)
+
+    // Space -> togglePlay(DeckId.A)
+    assertFalse(vm.uiState.value.deckA.isPlaying)
+    val playCmd = DjKeyboardShortcuts.mapNativeKeyEvent(
+      AndroidKeyEvent(AndroidKeyEvent.ACTION_DOWN, AndroidKeyEvent.KEYCODE_SPACE)
+    )!!
+    vm.handleKeyboardShortcut(playCmd)
+    assertTrue(vm.uiState.value.deckA.isPlaying)
+
+    // Scrub forward, then C -> cueDeck(DeckId.A) pauses & jumps to cue
+    vm.scrubDeck(DeckId.A, 0.25f)
+    assertTrue(vm.uiState.value.deckA.playheadProgress > 0.2f)
+    val cueCmd = DjKeyboardShortcuts.mapNativeKeyEvent(
+      AndroidKeyEvent(AndroidKeyEvent.ACTION_DOWN, AndroidKeyEvent.KEYCODE_C)
+    )!!
+    vm.handleKeyboardShortcut(cueCmd)
+    assertFalse(vm.uiState.value.deckA.isPlaying)
+    assertEquals(0f, vm.uiState.value.deckA.playheadProgress, 0.001f)
+
+    // S -> syncDeck(DeckId.A) matches Deck B effective BPM
+    val syncCmd = DjKeyboardShortcuts.mapNativeKeyEvent(
+      AndroidKeyEvent(AndroidKeyEvent.ACTION_DOWN, AndroidKeyEvent.KEYCODE_S)
+    )!!
+    vm.handleKeyboardShortcut(syncCmd)
+    assertEquals(
+      vm.uiState.value.deckB.effectiveBpm,
+      vm.uiState.value.deckA.effectiveBpm,
+      0.1f,
+    )
+  }
+
+  @Test
+  fun `one-tap stem presets remove voice or instrumental and toggle back`() {
+    val app = ApplicationProvider.getApplicationContext<Application>()
+    val vm = DjViewModel(app)
+
+    // Remove Voice (Instrumental)
+    vm.applyStemPreset(DeckId.A, com.example.dj.model.StemIsolationPreset.INSTRUMENTAL)
+    assertTrue(vm.uiState.value.deckA.isVoiceRemoved)
+    assertFalse(vm.uiState.value.deckA.isInstrumentalRemoved)
+    assertTrue(vm.uiState.value.deckA.stems[StemType.VOCALS]!!.isMuted)
+    assertFalse(vm.uiState.value.deckA.stems[StemType.DRUMS]!!.isMuted)
+
+    // Tapping NO VOICE again restores full mix
+    vm.applyStemPreset(DeckId.A, com.example.dj.model.StemIsolationPreset.INSTRUMENTAL)
+    assertFalse(vm.uiState.value.deckA.isVoiceRemoved)
+    assertFalse(vm.uiState.value.deckA.stems[StemType.VOCALS]!!.isMuted)
+
+    // Remove Instrumental (Acapella / Vox Only)
+    vm.applyStemPreset(DeckId.A, com.example.dj.model.StemIsolationPreset.ACAPELLA)
+    assertTrue(vm.uiState.value.deckA.isInstrumentalRemoved)
+    assertFalse(vm.uiState.value.deckA.stems[StemType.VOCALS]!!.isMuted)
+    assertTrue(vm.uiState.value.deckA.stems[StemType.BASS]!!.isMuted)
   }
 
   @Test

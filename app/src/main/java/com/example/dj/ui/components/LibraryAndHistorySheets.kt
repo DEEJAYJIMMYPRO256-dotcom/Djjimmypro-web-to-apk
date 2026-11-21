@@ -45,6 +45,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,10 +82,11 @@ fun TrackLibrarySheet(
   onDismiss: () -> Unit,
 ) {
   val context = LocalContext.current
-  var searchQuery by remember { mutableStateOf("") }
-  var smartPlaylistEnabled by remember { mutableStateOf(false) }
-  var showCamelotWheel by remember { mutableStateOf(false) }
-  var editingTrack by remember { mutableStateOf<DjTrack?>(null) }
+  var searchQuery by rememberSaveable { mutableStateOf("") }
+  var smartPlaylistEnabled by rememberSaveable { mutableStateOf(false) }
+  var showCamelotWheel by rememberSaveable { mutableStateOf(false) }
+  var editingTrackId by rememberSaveable { mutableStateOf<String?>(null) }
+  val editingTrack = remember(editingTrackId, tracks) { tracks.find { it.id == editingTrackId } }
 
   val exportDbLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {
@@ -300,7 +302,7 @@ fun TrackLibrarySheet(
               }
 
               IconButton(
-                onClick = { editingTrack = track },
+                onClick = { editingTrackId = track.id },
                 modifier = Modifier.minimumInteractiveComponentSize().testTag("edit_track_${track.id}"),
               ) {
                 Icon(
@@ -318,11 +320,11 @@ fun TrackLibrarySheet(
   }
 
   editingTrack?.let { track ->
-    var title by remember(track.id) { mutableStateOf(track.title) }
-    var artist by remember(track.id) { mutableStateOf(track.artist) }
-    var genre by remember(track.id) { mutableStateOf(track.genre) }
+    var title by rememberSaveable(track.id) { mutableStateOf(track.title) }
+    var artist by rememberSaveable(track.id) { mutableStateOf(track.artist) }
+    var genre by rememberSaveable(track.id) { mutableStateOf(track.genre) }
     AlertDialog(
-      onDismissRequest = { editingTrack = null },
+      onDismissRequest = { editingTrackId = null },
       title = { Text("Edit Track Metadata") },
       text = {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -335,14 +337,14 @@ fun TrackLibrarySheet(
         Button(
           onClick = {
             onUpdateMetadata(track.id, title, artist, genre)
-            editingTrack = null
+            editingTrackId = null
           }
         ) {
           Text("Save")
         }
       },
       dismissButton = {
-        TextButton(onClick = { editingTrack = null }) { Text("Cancel") }
+        TextButton(onClick = { editingTrackId = null }) { Text("Cancel") }
       },
     )
   }

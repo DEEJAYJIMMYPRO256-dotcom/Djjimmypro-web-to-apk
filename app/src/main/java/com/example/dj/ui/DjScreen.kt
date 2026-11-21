@@ -4,81 +4,84 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.FiberManualRecord
-import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Usb
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.core.view.ViewCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.dj.input.DjKeyboardShortcuts
 import com.example.dj.model.DeckId
+import com.example.dj.model.ProModeTab
 import com.example.dj.ui.components.CrossfaderMixerCard
-import com.example.dj.ui.components.DeckPanel
 import com.example.dj.ui.components.KeyboardShortcutsDialog
+import com.example.dj.ui.components.SamplePadsEffectsPanel
+import com.example.dj.ui.components.SeratoDeckCard
+import com.example.dj.ui.components.SeratoLibraryDock
+import com.example.dj.ui.components.SeratoTopProBar
 import com.example.dj.ui.components.SessionHistorySheet
+import com.example.dj.ui.components.StackedDualWaveforms
 import com.example.dj.ui.components.TrackLibrarySheet
 import kotlin.math.abs
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DjScreen(viewModel: DjViewModel) {
   val state by viewModel.uiState.collectAsStateWithLifecycle()
 
-  var showMidiSettings by remember { mutableStateOf(false) }
-  var libraryTargetDeck by remember { mutableStateOf<DeckId?>(null) }
-  var showHistorySheet by remember { mutableStateOf(false) }
-  var filePickerTargetDeck by remember { mutableStateOf(DeckId.A) }
+  var showMidiSettings by rememberSaveable { mutableStateOf(false) }
+  var libraryTargetDeck by rememberSaveable { mutableStateOf<DeckId?>(null) }
+  var showHistorySheet by rememberSaveable { mutableStateOf(false) }
+  var filePickerTargetDeck by rememberSaveable { mutableStateOf(DeckId.A) }
+  var isDockSearchFocused by rememberSaveable { mutableStateOf(false) }
+
+  val portraitScrollState = rememberScrollState()
+  val landscapeRootScrollState = rememberScrollState()
+  val landscapeDeckAScrollState = rememberScrollState()
+  val landscapeCenterScrollState = rememberScrollState()
+  val landscapeDeckBScrollState = rememberScrollState()
 
   val audioFilePicker =
     rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
       if (uri != null) {
         viewModel.loadLocalAudioUri(filePickerTargetDeck, uri)
+      }
+    }
+
+  val multiAudioImportPicker =
+    rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+      if (uris.isNotEmpty()) {
+        viewModel.importLocalAudioUris(uris)
       }
     }
 
@@ -94,13 +97,33 @@ fun DjScreen(viewModel: DjViewModel) {
 
   val focusRequester = remember { FocusRequester() }
   LaunchedEffect(libraryTargetDeck, showHistorySheet, state.showShortcutsDialog, showMidiSettings) {
-    if (libraryTargetDeck == null && !showHistorySheet && !state.showShortcutsDialog) {
+    if (libraryTargetDeck == null && !showHistorySheet && !state.showShortcutsDialog && !isDockSearchFocused) {
       runCatching { focusRequester.requestFocus() }
     }
   }
 
   val beatMatchDelta = abs(state.deckA.effectiveBpm - state.deckB.effectiveBpm)
-  val isModalOpen = libraryTargetDeck != null || showHistorySheet
+  val isModalOpen = libraryTargetDeck != null || showHistorySheet || isDockSearchFocused
+  val latestModalOpen by rememberUpdatedState(isModalOpen)
+  val latestViewModel by rememberUpdatedState(viewModel)
+  val hostView = LocalView.current
+
+  // Global physical keyboard listener so deck & crossfader shortcuts work even if no Compose node holds focus
+  DisposableEffect(hostView) {
+    val listener =
+      ViewCompat.OnUnhandledKeyEventListenerCompat { _, nativeEvent ->
+        if (latestModalOpen) return@OnUnhandledKeyEventListenerCompat false
+        val command = DjKeyboardShortcuts.mapNativeKeyEvent(nativeEvent)
+        if (command != null) {
+          latestViewModel.handleKeyboardShortcut(command)
+          true
+        } else {
+          false
+        }
+      }
+    ViewCompat.addOnUnhandledKeyEventListener(hostView, listener)
+    onDispose { ViewCompat.removeOnUnhandledKeyEventListener(hostView, listener) }
+  }
 
   Scaffold(
     contentWindowInsets = WindowInsets.safeDrawing,
@@ -120,137 +143,25 @@ fun DjScreen(viewModel: DjViewModel) {
           }
         },
     topBar = {
-      TopAppBar(
-        colors =
-          TopAppBarDefaults.topAppBarColors(
-            containerColor = state.mixerTheme.consoleSurface,
-            titleContentColor = MaterialTheme.colorScheme.onSurface,
-          ),
-        title = {
-          Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-          ) {
-            Text("STEMDECK DJ", style = MaterialTheme.typography.titleMedium)
-            state.connectedMidiDevice?.let { midiName ->
-              Surface(
-                shape = RoundedCornerShape(6.dp),
-                color = state.mixerTheme.deckAAccent.copy(alpha = 0.16f),
-              ) {
-                Row(
-                  modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                  Icon(
-                    Icons.Filled.Usb,
-                    contentDescription = "MIDI Connected",
-                    tint = state.mixerTheme.deckAAccent,
-                    modifier = Modifier.size(12.dp),
-                  )
-                  Text(
-                    text = midiName,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = state.mixerTheme.deckAAccent,
-                  )
-                }
-              }
-            }
-          }
-        },
-        actions = {
-          // Record Master Output WAV
-          Surface(
-            shape = RoundedCornerShape(8.dp),
-            color =
-              if (state.isRecording) Color(0xFFFF3B5C).copy(alpha = 0.24f)
-              else MaterialTheme.colorScheme.surfaceVariant,
-            modifier =
-              Modifier.clip(RoundedCornerShape(8.dp))
-                .clickable { viewModel.toggleRecording() }
-                .testTag("rec_button"),
-          ) {
-            Row(
-              modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-              Icon(
-                Icons.Filled.FiberManualRecord,
-                contentDescription = "Record master output",
-                tint = if (state.isRecording) Color(0xFFFF3B5C) else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(12.dp),
-              )
-              Text(
-                text = if (state.isRecording) "REC" else "REC",
-                style = MaterialTheme.typography.labelSmall,
-                color = if (state.isRecording) Color(0xFFFF3B5C) else MaterialTheme.colorScheme.onSurface,
-              )
-            }
-          }
-
-          Spacer(Modifier.width(6.dp))
-
-          // Theme Skin Switcher
-          Surface(
-            shape = RoundedCornerShape(8.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            modifier =
-              Modifier.clip(RoundedCornerShape(8.dp))
-                .clickable { viewModel.cycleMixerTheme() }
-                .testTag("theme_switcher_button"),
-          ) {
-            Row(
-              modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-              Icon(
-                Icons.Filled.Palette,
-                contentDescription = "Switch mixer theme",
-                tint = state.mixerTheme.deckAAccent,
-                modifier = Modifier.size(14.dp),
-              )
-              Text(
-                text = state.mixerTheme.label,
-                style = MaterialTheme.typography.labelSmall,
-              )
-            }
-          }
-
-          IconButton(
-            onClick = { viewModel.toggleShortcutsDialog(true) },
-            modifier = Modifier.minimumInteractiveComponentSize().testTag("shortcuts_help_button"),
-          ) {
-            Icon(
-              Icons.Filled.Keyboard,
-              contentDescription = "Keyboard shortcuts",
-              tint = MaterialTheme.colorScheme.onSurface,
-            )
-          }
-
-          IconButton(
-            onClick = { showHistorySheet = true },
-            modifier = Modifier.minimumInteractiveComponentSize().testTag("history_button"),
-          ) {
-            Icon(
-              Icons.Filled.History,
-              contentDescription = "Session history",
-              tint = MaterialTheme.colorScheme.onSurface,
-            )
-          }
-
-          IconButton(
-            onClick = { showMidiSettings = true },
-            modifier = Modifier.minimumInteractiveComponentSize().testTag("midi_settings_button"),
-          ) {
-            Icon(
-              Icons.Filled.Settings,
-              contentDescription = "MIDI and mixer settings",
-              tint = MaterialTheme.colorScheme.onSurface,
-            )
-          }
-        },
+      SeratoTopProBar(
+        activeTab = state.activeProTab,
+        mixerTheme = state.mixerTheme,
+        isRecording = state.isRecording,
+        connectedMidiDevice = state.connectedMidiDevice,
+        peakLeft = state.masterPeakLeft,
+        peakRight = state.masterPeakRight,
+        onSelectTab = { viewModel.setProModeTab(it) },
+        onToggleRecording = { viewModel.toggleRecording() },
+        onCycleTheme = { viewModel.cycleMixerTheme() },
+        onOpenShortcuts = { viewModel.toggleShortcutsDialog(true) },
+        onOpenSettings = { showMidiSettings = true },
+        masterBpm = state.effectiveMasterBpm,
+        isMasterTapActive = state.masterTappedBpm != null,
+        masterTapSource = state.masterTapSource,
+        lastMasterTapAtMs = state.lastMasterTapAtMs,
+        isAnyDeckPlaying = state.deckA.isPlaying || state.deckB.isPlaying,
+        onMasterTapTempo = { viewModel.tapMasterTempo() },
+        onResetMasterTap = { viewModel.resetMasterTapTempo() },
       )
     },
   ) { innerPadding ->
@@ -259,123 +170,249 @@ fun DjScreen(viewModel: DjViewModel) {
         Modifier.fillMaxSize()
           .background(state.mixerTheme.background)
           .padding(innerPadding)
-          .padding(horizontal = 12.dp, vertical = 10.dp)
+          .padding(horizontal = 8.dp, vertical = 6.dp)
     ) {
-      val isWideLayout = maxWidth >= 720.dp
+      val isLandscapeDualDeck = maxWidth >= 600.dp || (maxWidth > maxHeight && maxWidth >= 520.dp)
+      val isCompactLandscapeHeight = maxHeight < 520.dp
+      val centerPaneWidth = (maxWidth * 0.29f).coerceIn(242.dp, 312.dp)
 
-      if (isWideLayout) {
-        Row(
-          modifier = Modifier.fillMaxSize(),
-          horizontalArrangement = Arrangement.spacedBy(12.dp),
-          verticalAlignment = Alignment.Top,
+      if (isLandscapeDualDeck) {
+        val landscapeContainerModifier =
+          if (isCompactLandscapeHeight) {
+            Modifier.fillMaxSize().verticalScroll(landscapeRootScrollState).testTag("layout_landscape_dual_deck")
+          } else {
+            Modifier.fillMaxSize().testTag("layout_landscape_dual_deck")
+          }
+
+        Column(
+          modifier = landscapeContainerModifier,
+          verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-          Box(modifier = Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState())) {
-            DeckPanel(
-              deck = state.deckA,
-              mixerTheme = state.mixerTheme,
-              beatMatchDeltaBpm = beatMatchDelta,
-              eqPresets = state.eqPresets,
-              onTogglePlay = { viewModel.togglePlay(DeckId.A) },
-              onCue = { viewModel.cueDeck(DeckId.A) },
-              onSync = { viewModel.syncDeck(DeckId.A) },
-              onTapTempo = { viewModel.tapTempo(DeckId.A) },
-              onOpenLibrary = { libraryTargetDeck = DeckId.A },
-              onPickLocalFile = {
-                filePickerTargetDeck = DeckId.A
-                audioFilePicker.launch(arrayOf("audio/*"))
+          // Upper Serato Pro Dual-Deck + Center Stacked Waveforms & Crossfader Stage
+          Row(
+            modifier =
+              if (isCompactLandscapeHeight) {
+                Modifier.fillMaxWidth().heightIn(min = 380.dp)
+              } else {
+                Modifier.weight(1f).fillMaxWidth()
               },
-              onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.A, stem, lvl) },
-              onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.A, stem) },
-              onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.A, stem) },
-              onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.A, band, v) },
-              onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.A, preset) },
-              onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.A, f, e, fl) },
-              onTrimGainChange = { trim -> viewModel.setTrimGain(DeckId.A, trim) },
-              onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.A, off) },
-              onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.A) },
-              onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.A, deg) },
-              onScrubWaveform = { delta -> viewModel.scrubDeck(DeckId.A, delta) },
-              onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.A, slot) },
-              onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.A, slot) },
-              onToggleQuantize = { viewModel.toggleQuantize(DeckId.A) },
-              onToggleScratchMode = { viewModel.toggleScratchMode(DeckId.A) },
-              onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.A) },
-              onToggleLoop = { viewModel.toggleLoop(DeckId.A) },
-              onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.A) },
-              modifier = Modifier.fillMaxWidth(),
-            )
-          }
-
-          Box(
-            modifier = Modifier.width(260.dp).fillMaxHeight().verticalScroll(rememberScrollState()),
-            contentAlignment = Alignment.Center,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
           ) {
-            CrossfaderMixerCard(
-              crossfader = state.crossfader,
-              crossfaderCurve = state.crossfaderCurve,
-              peakLeft = state.masterPeakLeft,
-              peakRight = state.masterPeakRight,
-              autoMixEnabled = state.autoMixEnabled,
-              autoMixDurationSeconds = state.autoMixDurationSeconds,
-              isAutoMixing = state.isAutoMixing,
+            Box(
+              modifier =
+                if (isCompactLandscapeHeight) Modifier.weight(1f)
+                else Modifier.weight(1f).fillMaxHeight().verticalScroll(landscapeDeckAScrollState)
+            ) {
+              SeratoDeckCard(
+                deck = state.deckA,
+                mixerTheme = state.mixerTheme,
+                eqPresets = state.eqPresets,
+                activeProTab = state.activeProTab,
+                onTogglePlay = { viewModel.togglePlay(DeckId.A) },
+                onCue = { viewModel.cueDeck(DeckId.A) },
+                onSync = { viewModel.syncDeck(DeckId.A) },
+                onTapTempo = { viewModel.tapTempo(DeckId.A) },
+                onOpenLibrary = { libraryTargetDeck = DeckId.A },
+                onPickLocalFile = {
+                  filePickerTargetDeck = DeckId.A
+                  audioFilePicker.launch(arrayOf("audio/*"))
+                },
+                onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.A, stem, lvl) },
+                onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.A, stem) },
+                onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.A, stem) },
+                onApplyStemPreset = { preset -> viewModel.applyStemPreset(DeckId.A, preset) },
+                onToggleQuickIsolate = { viewModel.toggleQuickIsolateMode(DeckId.A) },
+                onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.A, band, v) },
+                onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.A, preset) },
+                onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.A, f, e, fl) },
+                onTrimGainChange = { trim -> viewModel.setTrimGain(DeckId.A, trim) },
+                onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.A, off) },
+                onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.A) },
+                onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.A, deg) },
+                onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.A, slot) },
+                onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.A, slot) },
+                onToggleQuantize = { viewModel.toggleQuantize(DeckId.A) },
+                onToggleScratchMode = { viewModel.toggleScratchMode(DeckId.A) },
+                onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.A) },
+                onToggleLoop = { viewModel.toggleLoop(DeckId.A) },
+                onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.A) },
+                onTriggerAutoLoop = { beats -> viewModel.triggerAutoLoop(DeckId.A, beats) },
+                onHalveLoop = { viewModel.halveLoop(DeckId.A) },
+                onDoubleLoop = { viewModel.doubleLoop(DeckId.A) },
+                otherDeckKey = state.deckB.effectiveMusicalKey,
+                onKeySync = { viewModel.keySyncDeck(DeckId.A) },
+                modifier = Modifier.fillMaxWidth(),
+              )
+            }
+
+            Column(
+              modifier =
+                if (isCompactLandscapeHeight) Modifier.width(centerPaneWidth)
+                else Modifier.width(centerPaneWidth).fillMaxHeight().verticalScroll(landscapeCenterScrollState),
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              StackedDualWaveforms(
+                deckA = state.deckA,
+                deckB = state.deckB,
+                mixerTheme = state.mixerTheme,
+                beatMatchDeltaBpm = beatMatchDelta,
+                onScrubA = { viewModel.scrubDeck(DeckId.A, it) },
+                onScrubB = { viewModel.scrubDeck(DeckId.B, it) },
+                waveformZoom = state.waveformZoom,
+                isWaveformNeutral = state.isWaveformNeutral,
+                onZoomOut = { viewModel.zoomOutWaveform() },
+                onZoomIn = { viewModel.zoomInWaveform() },
+                onZoomChange = { viewModel.setWaveformZoom(it) },
+                onToggleNeutral = { viewModel.toggleWaveformNeutral() },
+                compact = isCompactLandscapeHeight,
+              )
+              CrossfaderMixerCard(
+                crossfader = state.crossfader,
+                crossfaderCurve = state.crossfaderCurve,
+                peakLeft = state.masterPeakLeft,
+                peakRight = state.masterPeakRight,
+                autoMixEnabled = state.autoMixEnabled,
+                autoMixDurationSeconds = state.autoMixDurationSeconds,
+                isAutoMixing = state.isAutoMixing,
+                mixerTheme = state.mixerTheme,
+                shortcutFeedback = state.shortcutFeedback,
+                onCrossfaderChange = { viewModel.setCrossfader(it) },
+                onCycleCurve = { viewModel.cycleCrossfaderCurve() },
+                onToggleAutoMix = { viewModel.toggleAutoMix() },
+                onCycleAutoMixDuration = { viewModel.cycleAutoMixDuration() },
+                onOpenShortcuts = { viewModel.toggleShortcutsDialog(true) },
+                compact = isCompactLandscapeHeight,
+                deckATrimGain = state.deckA.trimGain,
+                deckBTrimGain = state.deckB.trimGain,
+                deckAInputLevel = state.deckA.inputSignalLevel,
+                deckBInputLevel = state.deckB.inputSignalLevel,
+                onDeckATrimChange = { viewModel.setTrimGain(DeckId.A, it) },
+                onDeckBTrimChange = { viewModel.setTrimGain(DeckId.B, it) },
+                modifier = Modifier.fillMaxWidth(),
+              )
+            }
+
+            Box(
+              modifier =
+                if (isCompactLandscapeHeight) Modifier.weight(1f)
+                else Modifier.weight(1f).fillMaxHeight().verticalScroll(landscapeDeckBScrollState)
+            ) {
+              SeratoDeckCard(
+                deck = state.deckB,
+                mixerTheme = state.mixerTheme,
+                eqPresets = state.eqPresets,
+                activeProTab = state.activeProTab,
+                onTogglePlay = { viewModel.togglePlay(DeckId.B) },
+                onCue = { viewModel.cueDeck(DeckId.B) },
+                onSync = { viewModel.syncDeck(DeckId.B) },
+                onTapTempo = { viewModel.tapTempo(DeckId.B) },
+                onOpenLibrary = { libraryTargetDeck = DeckId.B },
+                onPickLocalFile = {
+                  filePickerTargetDeck = DeckId.B
+                  audioFilePicker.launch(arrayOf("audio/*"))
+                },
+                onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.B, stem, lvl) },
+                onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.B, stem) },
+                onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.B, stem) },
+                onApplyStemPreset = { preset -> viewModel.applyStemPreset(DeckId.B, preset) },
+                onToggleQuickIsolate = { viewModel.toggleQuickIsolateMode(DeckId.B) },
+                onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.B, band, v) },
+                onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.B, preset) },
+                onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.B, f, e, fl) },
+                onTrimGainChange = { trim -> viewModel.setTrimGain(DeckId.B, trim) },
+                onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.B, off) },
+                onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.B) },
+                onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.B, deg) },
+                onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.B, slot) },
+                onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.B, slot) },
+                onToggleQuantize = { viewModel.toggleQuantize(DeckId.B) },
+                onToggleScratchMode = { viewModel.toggleScratchMode(DeckId.B) },
+                onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.B) },
+                onToggleLoop = { viewModel.toggleLoop(DeckId.B) },
+                onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.B) },
+                onTriggerAutoLoop = { beats -> viewModel.triggerAutoLoop(DeckId.B, beats) },
+                onHalveLoop = { viewModel.halveLoop(DeckId.B) },
+                onDoubleLoop = { viewModel.doubleLoop(DeckId.B) },
+                otherDeckKey = state.deckA.effectiveMusicalKey,
+                onKeySync = { viewModel.keySyncDeck(DeckId.B) },
+                modifier = Modifier.fillMaxWidth(),
+              )
+            }
+          }
+
+          if (state.activeProTab == ProModeTab.SAMPLER || state.activeProTab == ProModeTab.DJ || state.activeProTab == ProModeTab.FX) {
+            SamplePadsEffectsPanel(
+              selectedBank = state.selectedSampleBank,
+              activePadIds = state.activeSamplePadIds,
+              loopEnabled = state.samplePadLoopEnabled,
+              volume = state.samplePadVolume,
               mixerTheme = state.mixerTheme,
-              shortcutFeedback = state.shortcutFeedback,
-              onCrossfaderChange = { viewModel.setCrossfader(it) },
-              onCycleCurve = { viewModel.cycleCrossfaderCurve() },
-              onToggleAutoMix = { viewModel.toggleAutoMix() },
-              onCycleAutoMixDuration = { viewModel.cycleAutoMixDuration() },
-              onOpenShortcuts = { viewModel.toggleShortcutsDialog(true) },
-              modifier = Modifier.fillMaxWidth(),
+              onSelectBank = { viewModel.selectSampleBank(it) },
+              onTogglePad = { viewModel.toggleSamplePad(it) },
+              onToggleLoop = { viewModel.toggleSamplePadLoop() },
+              onStopAll = { viewModel.stopAllSamplePads() },
+              onVolumeChange = { viewModel.setSamplePadVolume(it) },
             )
           }
 
-          Box(modifier = Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState())) {
-            DeckPanel(
-              deck = state.deckB,
-              mixerTheme = state.mixerTheme,
-              beatMatchDeltaBpm = beatMatchDelta,
-              eqPresets = state.eqPresets,
-              onTogglePlay = { viewModel.togglePlay(DeckId.B) },
-              onCue = { viewModel.cueDeck(DeckId.B) },
-              onSync = { viewModel.syncDeck(DeckId.B) },
-              onTapTempo = { viewModel.tapTempo(DeckId.B) },
-              onOpenLibrary = { libraryTargetDeck = DeckId.B },
-              onPickLocalFile = {
-                filePickerTargetDeck = DeckId.B
-                audioFilePicker.launch(arrayOf("audio/*"))
-              },
-              onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.B, stem, lvl) },
-              onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.B, stem) },
-              onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.B, stem) },
-              onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.B, band, v) },
-              onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.B, preset) },
-              onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.B, f, e, fl) },
-              onTrimGainChange = { trim -> viewModel.setTrimGain(DeckId.B, trim) },
-              onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.B, off) },
-              onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.B) },
-              onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.B, deg) },
-              onScrubWaveform = { delta -> viewModel.scrubDeck(DeckId.B, delta) },
-              onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.B, slot) },
-              onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.B, slot) },
-              onToggleQuantize = { viewModel.toggleQuantize(DeckId.B) },
-              onToggleScratchMode = { viewModel.toggleScratchMode(DeckId.B) },
-              onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.B) },
-              onToggleLoop = { viewModel.toggleLoop(DeckId.B) },
-              onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.B) },
-              modifier = Modifier.fillMaxWidth(),
-            )
-          }
+          SeratoLibraryDock(
+            tracks = state.libraryTracks,
+            sessionHistory = state.sessionHistory,
+            prepareTrackIds = state.prepareTrackIds,
+            deckATrack = state.deckA.track,
+            deckBTrack = state.deckB.track,
+            selectedCrate = state.selectedCrate,
+            bottomTab = state.bottomLibraryTab,
+            searchQuery = state.librarySearchQuery,
+            sortColumn = state.librarySortColumn,
+            sortAscending = state.librarySortAscending,
+            isRefreshing = state.isRefreshingLibrary,
+            mixerTheme = state.mixerTheme,
+            onSelectCrate = { viewModel.selectCrate(it) },
+            onSelectBottomTab = { viewModel.setBottomLibraryTab(it) },
+            onSearchQueryChange = { viewModel.setLibrarySearchQuery(it) },
+            onSearchFocusChanged = { isDockSearchFocused = it },
+            onSortColumnClick = { viewModel.setLibrarySortColumn(it) },
+            onLoadToDeck = { deckId, track -> viewModel.loadTrack(deckId, track) },
+            onTogglePrepare = { viewModel.togglePrepareTrack(it) },
+            onImportFiles = { multiAudioImportPicker.launch(arrayOf("audio/*")) },
+            onRefreshLibrary = { viewModel.refreshLibrary() },
+          )
         }
       } else {
+        // Portrait Auto-Rotated Console
         Column(
-          modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
-          verticalArrangement = Arrangement.spacedBy(12.dp),
+          modifier =
+            Modifier.fillMaxSize()
+              .verticalScroll(portraitScrollState)
+              .testTag("layout_portrait_dual_deck"),
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-          DeckPanel(
-            deck = state.deckA,
+          Column(
+            modifier = Modifier.fillMaxWidth().widthIn(max = 640.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+          ) {
+          StackedDualWaveforms(
+            deckA = state.deckA,
+            deckB = state.deckB,
             mixerTheme = state.mixerTheme,
             beatMatchDeltaBpm = beatMatchDelta,
+            onScrubA = { viewModel.scrubDeck(DeckId.A, it) },
+            onScrubB = { viewModel.scrubDeck(DeckId.B, it) },
+            waveformZoom = state.waveformZoom,
+            isWaveformNeutral = state.isWaveformNeutral,
+            onZoomOut = { viewModel.zoomOutWaveform() },
+            onZoomIn = { viewModel.zoomInWaveform() },
+            onZoomChange = { viewModel.setWaveformZoom(it) },
+            onToggleNeutral = { viewModel.toggleWaveformNeutral() },
+          )
+
+          SeratoDeckCard(
+            deck = state.deckA,
+            mixerTheme = state.mixerTheme,
             eqPresets = state.eqPresets,
+            activeProTab = state.activeProTab,
             onTogglePlay = { viewModel.togglePlay(DeckId.A) },
             onCue = { viewModel.cueDeck(DeckId.A) },
             onSync = { viewModel.syncDeck(DeckId.A) },
@@ -388,6 +425,8 @@ fun DjScreen(viewModel: DjViewModel) {
             onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.A, stem, lvl) },
             onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.A, stem) },
             onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.A, stem) },
+            onApplyStemPreset = { preset -> viewModel.applyStemPreset(DeckId.A, preset) },
+            onToggleQuickIsolate = { viewModel.toggleQuickIsolateMode(DeckId.A) },
             onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.A, band, v) },
             onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.A, preset) },
             onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.A, f, e, fl) },
@@ -395,7 +434,6 @@ fun DjScreen(viewModel: DjViewModel) {
             onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.A, off) },
             onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.A) },
             onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.A, deg) },
-            onScrubWaveform = { delta -> viewModel.scrubDeck(DeckId.A, delta) },
             onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.A, slot) },
             onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.A, slot) },
             onToggleQuantize = { viewModel.toggleQuantize(DeckId.A) },
@@ -403,6 +441,11 @@ fun DjScreen(viewModel: DjViewModel) {
             onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.A) },
             onToggleLoop = { viewModel.toggleLoop(DeckId.A) },
             onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.A) },
+            onTriggerAutoLoop = { beats -> viewModel.triggerAutoLoop(DeckId.A, beats) },
+            onHalveLoop = { viewModel.halveLoop(DeckId.A) },
+            onDoubleLoop = { viewModel.doubleLoop(DeckId.A) },
+            otherDeckKey = state.deckB.effectiveMusicalKey,
+            onKeySync = { viewModel.keySyncDeck(DeckId.A) },
             modifier = Modifier.fillMaxWidth(),
           )
 
@@ -421,14 +464,20 @@ fun DjScreen(viewModel: DjViewModel) {
             onToggleAutoMix = { viewModel.toggleAutoMix() },
             onCycleAutoMixDuration = { viewModel.cycleAutoMixDuration() },
             onOpenShortcuts = { viewModel.toggleShortcutsDialog(true) },
+            deckATrimGain = state.deckA.trimGain,
+            deckBTrimGain = state.deckB.trimGain,
+            deckAInputLevel = state.deckA.inputSignalLevel,
+            deckBInputLevel = state.deckB.inputSignalLevel,
+            onDeckATrimChange = { viewModel.setTrimGain(DeckId.A, it) },
+            onDeckBTrimChange = { viewModel.setTrimGain(DeckId.B, it) },
             modifier = Modifier.fillMaxWidth(),
           )
 
-          DeckPanel(
+          SeratoDeckCard(
             deck = state.deckB,
             mixerTheme = state.mixerTheme,
-            beatMatchDeltaBpm = beatMatchDelta,
             eqPresets = state.eqPresets,
+            activeProTab = state.activeProTab,
             onTogglePlay = { viewModel.togglePlay(DeckId.B) },
             onCue = { viewModel.cueDeck(DeckId.B) },
             onSync = { viewModel.syncDeck(DeckId.B) },
@@ -441,6 +490,8 @@ fun DjScreen(viewModel: DjViewModel) {
             onStemLevelChange = { stem, lvl -> viewModel.setStemLevel(DeckId.B, stem, lvl) },
             onToggleStemMute = { stem -> viewModel.toggleStemMute(DeckId.B, stem) },
             onToggleStemSolo = { stem -> viewModel.toggleStemSolo(DeckId.B, stem) },
+            onApplyStemPreset = { preset -> viewModel.applyStemPreset(DeckId.B, preset) },
+            onToggleQuickIsolate = { viewModel.toggleQuickIsolateMode(DeckId.B) },
             onEqBandChange = { band, v -> viewModel.setEqBand(DeckId.B, band, v) },
             onApplyEqPreset = { preset -> viewModel.applyEqPreset(DeckId.B, preset) },
             onEffectsChange = { f, e, fl -> viewModel.setEffects(DeckId.B, f, e, fl) },
@@ -448,7 +499,6 @@ fun DjScreen(viewModel: DjViewModel) {
             onTempoOffsetChange = { off -> viewModel.setTempoOffset(DeckId.B, off) },
             onCyclePitchRange = { viewModel.cyclePitchRange(DeckId.B) },
             onRotateJogWheel = { deg -> viewModel.rotateJogWheel(DeckId.B, deg) },
-            onScrubWaveform = { delta -> viewModel.scrubDeck(DeckId.B, delta) },
             onHotCueTap = { slot -> viewModel.triggerOrSetHotCue(DeckId.B, slot) },
             onHotCueLongPress = { slot -> viewModel.clearHotCue(DeckId.B, slot) },
             onToggleQuantize = { viewModel.toggleQuantize(DeckId.B) },
@@ -456,8 +506,51 @@ fun DjScreen(viewModel: DjViewModel) {
             onToggleKeyLock = { viewModel.toggleKeyLock(DeckId.B) },
             onToggleLoop = { viewModel.toggleLoop(DeckId.B) },
             onCycleLoopBeats = { viewModel.cycleLoopBeats(DeckId.B) },
+            onTriggerAutoLoop = { beats -> viewModel.triggerAutoLoop(DeckId.B, beats) },
+            onHalveLoop = { viewModel.halveLoop(DeckId.B) },
+            onDoubleLoop = { viewModel.doubleLoop(DeckId.B) },
+            otherDeckKey = state.deckA.effectiveMusicalKey,
+            onKeySync = { viewModel.keySyncDeck(DeckId.B) },
             modifier = Modifier.fillMaxWidth(),
           )
+
+          SamplePadsEffectsPanel(
+            selectedBank = state.selectedSampleBank,
+            activePadIds = state.activeSamplePadIds,
+            loopEnabled = state.samplePadLoopEnabled,
+            volume = state.samplePadVolume,
+            mixerTheme = state.mixerTheme,
+            onSelectBank = { viewModel.selectSampleBank(it) },
+            onTogglePad = { viewModel.toggleSamplePad(it) },
+            onToggleLoop = { viewModel.toggleSamplePadLoop() },
+            onStopAll = { viewModel.stopAllSamplePads() },
+            onVolumeChange = { viewModel.setSamplePadVolume(it) },
+          )
+
+          SeratoLibraryDock(
+            tracks = state.libraryTracks,
+            sessionHistory = state.sessionHistory,
+            prepareTrackIds = state.prepareTrackIds,
+            deckATrack = state.deckA.track,
+            deckBTrack = state.deckB.track,
+            selectedCrate = state.selectedCrate,
+            bottomTab = state.bottomLibraryTab,
+            searchQuery = state.librarySearchQuery,
+            sortColumn = state.librarySortColumn,
+            sortAscending = state.librarySortAscending,
+            isRefreshing = state.isRefreshingLibrary,
+            mixerTheme = state.mixerTheme,
+            onSelectCrate = { viewModel.selectCrate(it) },
+            onSelectBottomTab = { viewModel.setBottomLibraryTab(it) },
+            onSearchQueryChange = { viewModel.setLibrarySearchQuery(it) },
+            onSearchFocusChanged = { isDockSearchFocused = it },
+            onSortColumnClick = { viewModel.setLibrarySortColumn(it) },
+            onLoadToDeck = { deckId, track -> viewModel.loadTrack(deckId, track) },
+            onTogglePrepare = { viewModel.togglePrepareTrack(it) },
+            onImportFiles = { multiAudioImportPicker.launch(arrayOf("audio/*")) },
+            onRefreshLibrary = { viewModel.refreshLibrary() },
+          )
+          }
         }
       }
     }

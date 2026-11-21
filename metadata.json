@@ -1,5 +1,5 @@
 {
-  "name": "StemDeck DJ",
+  "name": "Serato Dj Pro",
   "description": "Dual-deck Serato-style DJ mixer with 4-stem isolation, beat-synced waveforms, 3-band EQ, real-time FX, USB MIDI mapping, and keyboard shortcuts.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
